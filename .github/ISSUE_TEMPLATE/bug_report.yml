@@ -1,0 +1,54 @@
+name: Bug report
+description: Report a reproducible ZentSSH problem.
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include passwords, private keys, session cookies, OIDC secrets, database files or `.zsb` backup passwords. Security vulnerabilities should be reported privately as described in `SECURITY.md`.
+  - type: input
+    id: version
+    attributes:
+      label: ZentSSH version
+      placeholder: 0.2.2-dev
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Docker Compose
+        - Docker / container platform
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Redact hosts, usernames, tokens, keys and other sensitive data.
+      render: shell
+  - type: input
+    id: proxy
+    attributes:
+      label: Reverse proxy / browser
+      placeholder: e.g. Caddy + Firefox 143, or direct access

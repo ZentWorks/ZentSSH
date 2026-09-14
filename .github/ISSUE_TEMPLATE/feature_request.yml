@@ -1,0 +1,24 @@
+name: Feature request
+description: Suggest a focused improvement for ZentSSH.
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: usecase
+    attributes:
+      label: Use case
+      description: What problem should ZentSSH solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful version of the feature.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security / compatibility considerations
+      description: Note any effect on credentials, SSH/SFTP behavior, existing installations or reverse proxies.
