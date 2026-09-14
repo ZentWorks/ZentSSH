@@ -8,8 +8,21 @@ RUN npm run check && npm run build
 FROM golang:1.27.1-alpine3.24 AS backend
 WORKDIR /src/backend
 RUN apk add --no-cache ca-certificates git
+ENV GOPROXY=https://proxy.golang.org,direct \
+    GOSUMDB=sum.golang.org
 COPY backend/go.mod backend/go.sum ./
-RUN go mod download && go mod verify
+RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
+    set -eu; \
+    attempt=1; \
+    while ! go mod download; do \
+      if [ "$attempt" -ge 4 ]; then \
+        echo "go mod download failed after ${attempt} attempts" >&2; \
+        exit 1; \
+      fi; \
+      sleep $((attempt * 5)); \
+      attempt=$((attempt + 1)); \
+    done; \
+    go mod verify
 COPY backend/cmd ./cmd
 COPY backend/internal ./internal
 RUN CGO_ENABLED=0 GOOS=linux go build -mod=readonly -trimpath -ldflags='-s -w' -o /out/zentssh ./cmd/zentssh
