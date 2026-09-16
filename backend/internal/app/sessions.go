@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -555,6 +556,8 @@ func (a *App) wsSSH(w http.ResponseWriter, r *http.Request) {
 	}
 	ws, err := a.upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		log.Printf("websocket upgrade rejected: origin=%q host=%q effective_host=%q effective_proto=%q client=%q error=%q",
+			strings.TrimSpace(r.Header.Get("Origin")), strings.TrimSpace(r.Host), a.effectiveHost(r), a.effectiveProto(r), a.clientIP(r), err.Error())
 		return
 	}
 	ws.SetReadLimit(1 << 20)

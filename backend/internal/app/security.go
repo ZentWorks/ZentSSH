@@ -283,10 +283,25 @@ func (a *App) validWebSocketOrigin(r *http.Request) bool {
 	if err != nil || u.Host == "" {
 		return false
 	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return false
+	}
 	if strings.ToLower(u.Host) != a.effectiveHost(r) {
 		return false
 	}
-	return strings.ToLower(u.Scheme) == a.effectiveProto(r)
+
+	// An explicit BASE_URL is authoritative and remains strict. Without it,
+	// a reverse proxy may terminate HTTPS and forward plain HTTP to ZentSSH.
+	// In that common deployment the browser Origin is https while the
+	// backend request itself is http, so host equality is the trust boundary.
+	if a.cfg.BaseURL != nil {
+		return scheme == strings.ToLower(a.cfg.BaseURL.Scheme)
+	}
+	if scheme == a.effectiveProto(r) {
+		return true
+	}
+	return scheme == "https" && a.effectiveProto(r) == "http"
 }
 
 func (a *App) secureCookie(r *http.Request) bool {
