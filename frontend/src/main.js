@@ -37,6 +37,97 @@ const state = {
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+
+let deferredInstallPrompt = null;
+
+function isStandaloneApp() {
+  return window.matchMedia?.('(display-mode: standalone)').matches || window.navigator.standalone === true;
+}
+
+function isIOSBrowser() {
+  return /iphone|ipad|ipod/i.test(navigator.userAgent || '');
+}
+
+function isMobileLayout() {
+  return window.matchMedia?.('(max-width: 760px)').matches === true;
+}
+
+function refitActiveTerminal(delay = 0) {
+  const run = () => {
+    const tab = state.tabs.find(item => item.id === state.active && item.type === 'terminal');
+    try { tab?.fit?.fit(); } catch { /* terminal may be between renders */ }
+  };
+  if (delay > 0) setTimeout(run, delay);
+  else requestAnimationFrame(run);
+}
+
+function updateVisualViewport() {
+  const height = Math.round(window.visualViewport?.height || window.innerHeight || document.documentElement.clientHeight || 0);
+  if (height > 0) document.documentElement.style.setProperty('--zent-viewport-height', `${height}px`);
+  refitActiveTerminal(80);
+}
+
+function setMobileNav(open) {
+  const shell = $('.shell');
+  if (!shell) return;
+  const next = Boolean(open && isMobileLayout());
+  shell.classList.toggle('mobile-nav-open', next);
+  $('#mobile-menu')?.setAttribute('aria-expanded', next ? 'true' : 'false');
+  const sidebar = $('#app-sidebar');
+  sidebar?.setAttribute('aria-hidden', next ? 'false' : (isMobileLayout() ? 'true' : 'false'));
+  if (sidebar) sidebar.inert = isMobileLayout() && !next;
+  refitActiveTerminal(230);
+}
+
+function closeMobileNav() { setMobileNav(false); }
+
+function syncPWAInstallButton() {
+  const available = !isStandaloneApp() && Boolean(deferredInstallPrompt || isIOSBrowser());
+  $$('.pwa-install').forEach(button => { button.hidden = !available; });
+}
+
+async function requestPWAInstall() {
+  closeMobileNav();
+  if (isStandaloneApp()) return;
+  if (deferredInstallPrompt) {
+    const prompt = deferredInstallPrompt;
+    deferredInstallPrompt = null;
+    await prompt.prompt();
+    try { await prompt.userChoice; } catch { /* browser may not expose a result */ }
+    syncPWAInstallButton();
+    return;
+  }
+  if (isIOSBrowser()) {
+    showToast(L('Safari: Teilen → Zum Home-Bildschirm','Safari: Share → Add to Home Screen'));
+  }
+}
+
+function registerPWA() {
+  if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js', { scope: '/', updateViaCache: 'none' }).catch(() => {});
+  }, { once: true });
+}
+
+window.addEventListener('beforeinstallprompt', event => {
+  event.preventDefault();
+  deferredInstallPrompt = event;
+  syncPWAInstallButton();
+});
+window.addEventListener('appinstalled', () => {
+  deferredInstallPrompt = null;
+  syncPWAInstallButton();
+  showToast(L('ZentSSH wurde installiert.','ZentSSH was installed.'));
+});
+window.addEventListener('resize', updateVisualViewport, { passive: true });
+window.visualViewport?.addEventListener('resize', updateVisualViewport, { passive: true });
+window.visualViewport?.addEventListener('scroll', updateVisualViewport, { passive: true });
+window.matchMedia?.('(max-width: 760px)').addEventListener?.('change', event => {
+  if (!event.matches) closeMobileNav();
+  updateVisualViewport();
+});
+registerPWA();
+updateVisualViewport();
 const esc = (s = '') => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 function browserLanguage() {
   const value = String(navigator.languages?.[0] || navigator.language || 'en').toLowerCase();
@@ -658,19 +749,26 @@ function renderApp() {
   const workspaceSelector = state.workspaces.length ? `<div class="workspace-switcher"><select id="workspace-selector" aria-label="${esc(L('Arbeitsbereich auswählen','Select workspace'))}"><option value="0">${esc(personalWorkspaceLabel())}</option>${state.workspaces.map(workspace => `<option value="${workspace.id}">${esc(workspace.name)}${workspace.active ? '' : ` · ${esc(L('deaktiviert','disabled'))}`}</option>`).join('')}</select></div>` : '';
   app.innerHTML = `
     <div class="shell">
-      <aside>
-        <div class="brand"><div class="brand-identity"><img class="brand-logo" src="/zentssh-logo.png" alt="" aria-hidden="true"><div class="brand-copy"><b>ZentSSH</b><small>Workspace</small></div></div><button id="profile-menu" class="brand-profile" type="button" data-tooltip="${esc(L('Mein Profil','My profile'))}">${esc(state.me?.name || '')}</button></div>
+      <aside id="app-sidebar" aria-label="${esc(L('Navigation','Navigation'))}">
+        <div class="brand"><div class="brand-identity"><img class="brand-logo" src="/zentssh-logo.png" alt="" aria-hidden="true"><div class="brand-copy"><b>ZentSSH</b><small>Workspace</small></div></div><div class="brand-actions"><button id="profile-menu" class="brand-profile" type="button" data-tooltip="${esc(L('Mein Profil','My profile'))}">${esc(state.me?.name || '')}</button><button id="mobile-sidebar-close" class="mobile-sidebar-close" type="button" aria-label="${esc(L('Navigation schließen','Close navigation'))}">×</button></div></div>
         <div class="toolbar"><div class="toolbar-create"><button id="add-server"><span class="toolbar-action-icon">+</span><span>${L('Server','Server')}</span></button><button id="add-folder"><span class="toolbar-action-icon">+</span><span>${L('Ordner','Folder')}</span></button></div><button id="quick-connect" class="quick-connect-button"><span class="toolbar-action-icon">⚡</span><span>Quick Connect</span></button></div>
         ${workspaceSelector}
         <div class="search"><input id="server-search" placeholder="${esc(L('Server suchen','Search servers'))}" autocomplete="off"></div>
         <div id="tree" class="tree"></div>
         <div class="asidefoot">
+          <button id="pwa-install" class="pwa-install" type="button" hidden>⇩ ${L('App installieren','Install app')}</button>
           <button id="transfers">⇄ ${L('Transfers','Transfers')}</button>
           <button id="settings">⚙ ${L('Einstellungen','Settings')}</button>
           <button id="logout">${L('Abmelden','Sign out')}</button>
         </div>
       </aside>
+      <button id="mobile-nav-overlay" class="mobile-nav-overlay" type="button" aria-label="${esc(L('Navigation schließen','Close navigation'))}" tabindex="-1"></button>
       <main>
+        <div class="mobile-appbar">
+          <button id="mobile-menu" class="mobile-appbar-button" type="button" aria-expanded="false" aria-controls="app-sidebar" aria-label="${esc(L('Navigation öffnen','Open navigation'))}">${actionIcon('menu')}</button>
+          <div class="mobile-app-brand"><img src="/zentssh-logo.png" alt="" aria-hidden="true"><b>ZentSSH</b></div>
+          <button id="mobile-profile" class="mobile-appbar-button" type="button" aria-label="${esc(L('Mein Profil','My profile'))}">${actionIcon('profile')}</button>
+        </div>
         <div id="tabs" class="tabs"></div>
         <div id="workspace" class="workspace">
           <div class="empty"><h2>${L('Server auswählen → arbeiten.','Select a server → start working.')}</h2><p>${L('Rechtsklick auf einen Server öffnet SSH, Transfer und Einstellungen.','Right-click a server to open SSH, file transfer or settings.')}</p></div>
@@ -682,12 +780,17 @@ function renderApp() {
     </div>`;
   installModalAutofocus();
   $('#logout').onclick = async () => { await api('/logout', { method: 'POST' }); location.reload(); };
-  $('#settings').onclick = () => openSettings();
-  $('#profile-menu').onclick = () => openProfile();
-  if ($('#transfers')) $('#transfers').onclick = () => openTransferCenter();
-  if ($('#add-server')) $('#add-server').onclick = () => serverModal();
-  if ($('#add-folder')) $('#add-folder').onclick = () => folderModal();
-  if ($('#quick-connect')) $('#quick-connect').onclick = () => quickConnectModal();
+  $('#settings').onclick = () => { closeMobileNav(); openSettings(); };
+  $('#profile-menu').onclick = () => { closeMobileNav(); openProfile(); };
+  $('#mobile-profile').onclick = () => { closeMobileNav(); openProfile(); };
+  $('#mobile-menu').onclick = () => setMobileNav(!$('.shell')?.classList.contains('mobile-nav-open'));
+  $('#mobile-sidebar-close').onclick = closeMobileNav;
+  $('#mobile-nav-overlay').onclick = closeMobileNav;
+  $('#pwa-install').onclick = requestPWAInstall;
+  if ($('#transfers')) $('#transfers').onclick = () => { closeMobileNav(); openTransferCenter(); };
+  if ($('#add-server')) $('#add-server').onclick = () => { closeMobileNav(); serverModal(); };
+  if ($('#add-folder')) $('#add-folder').onclick = () => { closeMobileNav(); folderModal(); };
+  if ($('#quick-connect')) $('#quick-connect').onclick = () => { closeMobileNav(); quickConnectModal(); };
   if ($('#workspace-selector')) {
     $('#workspace-selector').value = String(Number(state.activeWorkspaceId || 0));
     $('#workspace-selector').onchange = () => switchWorkspace(Number($('#workspace-selector').value || 0));
@@ -696,6 +799,8 @@ function renderApp() {
   syncWorkspaceControls();
   renderTree();
   renderTabs();
+  syncPWAInstallButton();
+  setMobileNav(false);
   restoreTrackedSessions();
   if (state.notice) {
     showToast(state.notice);
@@ -714,7 +819,10 @@ function renderTree() {
     }
     const results = state.serverSearchResults || [];
     tree.innerHTML = results.length ? `<div class="server-search-results">${results.map(result => `<button class="server-search-result" type="button" data-id="${result.id}" data-workspace-id="${result.workspaceId || 0}"><span class="server-status unknown"></span><span class="server-meta"><strong>${esc(result.name)}</strong><small>${esc(result.username || '')}${result.username ? '@' : ''}${esc(result.host)}</small><em>${esc(result.workspaceName || personalWorkspaceLabel())}${result.templateName ? ` · ${esc(L('Vorlage','Template'))}: ${esc(result.templateName)}` : ''}</em></span></button>`).join('')}</div>` : `<div class="tree-empty">${esc(L('Keine Server gefunden.','No servers found.'))}</div>`;
-    $$('.server-search-result', tree).forEach(row => row.onclick = () => switchWorkspace(Number(row.dataset.workspaceId || 0), { selectServerId: Number(row.dataset.id) }));
+    $$('.server-search-result', tree).forEach(row => row.onclick = () => {
+      switchWorkspace(Number(row.dataset.workspaceId || 0), { selectServerId: Number(row.dataset.id) });
+      if (isMobileLayout()) closeMobileNav();
+    });
     return;
   }
   const permissions = currentWorkspacePermissions();
@@ -733,6 +841,7 @@ function renderTree() {
       return `<div class="server ${canDrag ? 'can-drag' : ''} ${Number(state.selectedServerId) === Number(s.id) ? 'selected' : ''}" data-id="${s.id}" style="--depth:${depth}" tabindex="0" aria-selected="${Number(state.selectedServerId) === Number(s.id) ? 'true' : 'false'}">
       <div class="server-indicators"><span class="server-status ${esc(state.serverStatus[s.id]?.status || 'unknown')}" data-tooltip="${esc(serverStatusLabel(state.serverStatus[s.id]?.status || 'unknown'))}" aria-label="${esc(serverStatusLabel(state.serverStatus[s.id]?.status || 'unknown'))}"></span>${inherited}</div>
       <div class="server-meta"><strong>${esc(s.name)}</strong><small>${esc(s.username)}@${esc(s.host)}:${Number(s.port || 22)}</small></div>
+      <button class="server-mobile-actions" type="button" aria-label="${esc(L('Serveraktionen','Server actions'))}">⋮</button>
     </div>`;
     }).join('');
   const collapsedFolderIds = new Set((state.userSettings?.collapsedFolderIds || []).map(Number));
@@ -750,9 +859,18 @@ function renderTree() {
   $$('.server', tree).forEach(row => {
     const id = Number(row.dataset.id);
     const server = state.servers.find(item => Number(item.id) === id);
-    row.onclick = () => {
+    row.onclick = event => {
+      if (event.target.closest('.server-mobile-actions')) return;
       if (Date.now() < state.suppressServerClickUntil) return;
       selectServerRow(id, tree);
+    };
+    const mobileActions = $('.server-mobile-actions', row);
+    if (mobileActions) mobileActions.onclick = event => {
+      event.preventDefault();
+      event.stopPropagation();
+      selectServerRow(id, tree);
+      const rect = mobileActions.getBoundingClientRect();
+      showServerContextMenu({ preventDefault() {}, clientX: rect.right, clientY: rect.bottom }, id, row);
     };
     row.oncontextmenu = event => {
       event.preventDefault();
@@ -1007,6 +1125,7 @@ function closeServerContextMenu() {
 
 function actionIcon(type) {
   const icons = {
+    menu: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>',
     terminal: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4z"/><path d="m7 9 3 3-3 3M12 15h5"/></svg>',
     server: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="3" width="16" height="7" rx="1.5"/><rect x="4" y="14" width="16" height="7" rx="1.5"/><path d="M8 6.5h.01M8 17.5h.01M12 6.5h5M12 17.5h5"/></svg>',
     files: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6.5a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M8 13h8M13 10l3 3-3 3"/></svg>',
@@ -1087,6 +1206,7 @@ function showServerContextMenu(event, serverId, row) {
     button.onclick = () => {
       const action = button.dataset.action;
       closeServerContextMenu();
+      if (isMobileLayout()) closeMobileNav();
       if (action === 'ssh') openTerm(serverId);
       else if (action === 'files') openFiles(serverId);
       else if (action === 'settings') serverModal(server);
@@ -1147,6 +1267,7 @@ function renderTabs() {
     };
     tab.onpointerdown = event => startTabPointerDrag(event, tab, tabs);
   });
+  if (isMobileLayout()) requestAnimationFrame(() => $('.tab.active', tabs)?.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' }));
 }
 
 function startTabPointerDrag(event, tab, tabs) {
@@ -2631,12 +2752,19 @@ async function refreshFileDirectory(tab, path = '.', options = {}) {
       <div class="file-name-cell"><span class="file-type-icon">${actionIcon(entry.dir ? 'folder' : (isImageFile(entry.name) ? 'image' : 'file'))}</span><div><b>${esc(entry.name)}</b><small>${entry.dir ? 'Ordner' : (isImageFile(entry.name) ? 'Bild' : 'Datei')}</small></div></div>
       <span class="file-size">${entry.dir ? '—' : fmtSize(entry.size)}</span>
       <span class="file-mode">${esc(entry.mode)}</span>
-    </div>`).join('') : '<div class="fileempty"><b>Dieser Ordner ist leer.</b><span>Rechtsklick hier öffnet die Dateiaktionen.</span></div>');
+      <button class="file-mobile-actions" type="button" aria-label="${esc(L('Dateiaktionen','File actions'))}">⋮</button>
+    </div>`).join('') : `<div class="fileempty"><b>${esc(L('Dieser Ordner ist leer.','This folder is empty.'))}</b><span>${esc(isMobileLayout() ? L('Über „Neu / Upload“ kannst du Dateien und Ordner hinzufügen.','Use “New / Upload” to add files and folders.') : L('Rechtsklick hier öffnet die Dateiaktionen.','Right-click here to open file actions.'))}</span></div>`);
 
     $$('.file-entry', body).forEach(row => {
       const isDir = row.dataset.dir === '1';
-      if (isDir) row.onclick = () => refreshFileDirectory(tab, row.dataset.path);
-      else row.ondblclick = () => isImageFile(row.dataset.path) ? imageViewerModal(serverId, row.dataset.path) : fileEditorModal(serverId, row.dataset.path, path);
+      if (isDir) row.onclick = event => { if (!event.target.closest('.file-mobile-actions')) refreshFileDirectory(tab, row.dataset.path); };
+      else {
+        row.onclick = event => {
+          if (!isMobileLayout() || event.target.closest('.file-mobile-actions')) return;
+          isImageFile(row.dataset.path) ? imageViewerModal(serverId, row.dataset.path) : fileEditorModal(serverId, row.dataset.path, path);
+        };
+        row.ondblclick = () => isImageFile(row.dataset.path) ? imageViewerModal(serverId, row.dataset.path) : fileEditorModal(serverId, row.dataset.path, path);
+      }
       if (!row.classList.contains('parent-entry')) {
         row.oncontextmenu = event => {
           event.preventDefault();
@@ -2645,6 +2773,13 @@ async function refreshFileDirectory(tab, path = '.', options = {}) {
             uid: numericDatasetValue(row.dataset.uid),
             gid: numericDatasetValue(row.dataset.gid),
           });
+        };
+        const mobileActions = $('.file-mobile-actions', row);
+        if (mobileActions) mobileActions.onclick = event => {
+          event.preventDefault();
+          event.stopPropagation();
+          const rect = mobileActions.getBoundingClientRect();
+          row.oncontextmenu({ preventDefault() {}, stopPropagation() {}, clientX: rect.right, clientY: rect.bottom });
         };
         row.onkeydown = event => {
           if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
@@ -3240,8 +3375,8 @@ async function openDualFiles(leftServerId, rightServerId = null, leftPath = '.',
     return options.map(s => `<option value="${s.id}" ${Number(s.id) === Number(selected) ? 'selected' : ''}>${esc(s.name)} · ${esc(s.host)}</option>`).join('');
   };
   const paneMarkup = (side, serverId, panePath) => `<section class="filepane" data-side="${side}"><div class="panehead"><select class="pane-server">${serverOptions(serverId)}</select><div><input class="pane-path" value="${esc(panePath)}"><button class="pane-open button-with-icon">${iconLabel('open', 'Öffnen')}</button></div><input class="pane-upload" type="file" hidden></div><div class="pane-body">Lade…</div></section>`;
-  workspace.innerHTML = `<div class="dual-files" data-dual-files>
-    <div class="dual-toolbar"><b class="dual-title"><span class="dual-title-icon">${actionIcon('dual')}</span><span>Dual File Manager</span></b><button id="dual-close" class="button-with-icon">${iconLabel('files', 'Einzelansicht')}</button></div>
+  workspace.innerHTML = `<div class="dual-files" data-dual-files data-mobile-pane="left">
+    <div class="dual-toolbar"><b class="dual-title"><span class="dual-title-icon">${actionIcon('dual')}</span><span>Dual File Manager</span></b><div class="dual-mobile-switch" role="tablist" aria-label="${esc(L('Dateiansicht','File view'))}"><button type="button" class="active" data-dual-show="left" role="tab" aria-selected="true">${L('Quelle','Source')}</button><button type="button" data-dual-show="right" role="tab" aria-selected="false">${L('Ziel','Target')}</button></div><button id="dual-close" class="button-with-icon">${iconLabel('files', 'Einzelansicht')}</button></div>
     <div class="dual-grid">
       ${paneMarkup('left', leftServerId, leftPath)}
       <div class="dual-divider" aria-hidden="true">⇄</div>
@@ -3249,6 +3384,15 @@ async function openDualFiles(leftServerId, rightServerId = null, leftPath = '.',
     </div>
   </div>`;
   $('#dual-close').onclick = () => openFiles(Number($('.filepane[data-side="left"] .pane-server').value), $('.filepane[data-side="left"] .pane-path').value || '.');
+  $$('.dual-mobile-switch button', workspace).forEach(button => button.onclick = () => {
+    const root = $('[data-dual-files]', workspace);
+    root.dataset.mobilePane = button.dataset.dualShow;
+    $$('.dual-mobile-switch button', root).forEach(item => {
+      const active = item === button;
+      item.classList.toggle('active', active);
+      item.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+  });
   for (const pane of $$('.filepane', workspace)) {
     $('.pane-server', pane).onchange = () => loadDualPane(pane, Number($('.pane-server', pane).value), '.');
     $('.pane-open', pane).onclick = () => loadDualPane(pane, Number($('.pane-server', pane).value), $('.pane-path', pane).value || '.');
@@ -3325,12 +3469,18 @@ async function loadDualPane(pane, serverId, path = '.') {
   body.dataset.loaded = '1';
   const rows = [{ name: '..', path: parent(currentPath), dir: true, parent: true, uid: null, gid: null }, ...sortRemoteEntries(data.entries || [])];
   const parentColor = configuredServerColor(serverId);
-  body.innerHTML = rows.map(entry => `<div class="pane-row ${entry.parent ? 'parent-pane-row' : ''}" data-path="${esc(entry.path)}" data-name="${esc(entry.name)}" data-dir="${entry.dir ? 1 : 0}" data-parent="${entry.parent ? 1 : 0}" data-uid="${entry.uid == null ? '' : esc(entry.uid)}" data-gid="${entry.gid == null ? '' : esc(entry.gid)}" draggable="${!entry.parent ? 'true' : 'false'}"><span class="pane-type-icon"${entry.parent ? ` style="color:${esc(parentColor)}"` : ''}>${entry.parent ? '↰' : actionIcon(entry.dir ? 'folder' : (isImageFile(entry.name) ? 'image' : 'file'))}</span><b>${esc(entry.name)}</b><small>${entry.dir ? '' : fmtSize(entry.size)}</small></div>`).join('');
+  body.innerHTML = rows.map(entry => `<div class="pane-row ${entry.parent ? 'parent-pane-row' : ''}" data-path="${esc(entry.path)}" data-name="${esc(entry.name)}" data-dir="${entry.dir ? 1 : 0}" data-parent="${entry.parent ? 1 : 0}" data-uid="${entry.uid == null ? '' : esc(entry.uid)}" data-gid="${entry.gid == null ? '' : esc(entry.gid)}" draggable="${!entry.parent ? 'true' : 'false'}"><span class="pane-type-icon"${entry.parent ? ` style="color:${esc(parentColor)}"` : ''}>${entry.parent ? '↰' : actionIcon(entry.dir ? 'folder' : (isImageFile(entry.name) ? 'image' : 'file'))}</span><b>${esc(entry.name)}</b><small>${entry.dir ? '' : fmtSize(entry.size)}</small>${entry.parent ? '' : `<button class="pane-mobile-actions" type="button" aria-label="${esc(L('Dateiaktionen','File actions'))}">⋮</button>`}</div>`).join('');
   $$('.pane-row', body).forEach(row => {
     const isDir = row.dataset.dir === '1';
     const isParent = row.dataset.parent === '1';
-    if (isDir) row.onclick = () => loadDualPane(pane, serverId, row.dataset.path);
-    else row.ondblclick = () => isImageFile(row.dataset.path) ? imageViewerModal(serverId, row.dataset.path) : fileEditorModal(serverId, row.dataset.path, currentPath);
+    if (isDir) row.onclick = event => { if (!event.target.closest('.pane-mobile-actions')) loadDualPane(pane, serverId, row.dataset.path); };
+    else {
+      row.onclick = event => {
+        if (!isMobileLayout() || event.target.closest('.pane-mobile-actions')) return;
+        isImageFile(row.dataset.path) ? imageViewerModal(serverId, row.dataset.path) : fileEditorModal(serverId, row.dataset.path, currentPath);
+      };
+      row.ondblclick = () => isImageFile(row.dataset.path) ? imageViewerModal(serverId, row.dataset.path) : fileEditorModal(serverId, row.dataset.path, currentPath);
+    }
     if (!isParent) {
       row.oncontextmenu = event => {
         event.preventDefault();
@@ -3341,6 +3491,13 @@ async function loadDualPane(pane, serverId, path = '.') {
           uid: numericDatasetValue(row.dataset.uid),
           gid: numericDatasetValue(row.dataset.gid),
         });
+      };
+      const mobileActions = $('.pane-mobile-actions', row);
+      if (mobileActions) mobileActions.onclick = event => {
+        event.preventDefault();
+        event.stopPropagation();
+        const rect = mobileActions.getBoundingClientRect();
+        row.oncontextmenu({ preventDefault() {}, stopPropagation() {}, clientX: rect.right, clientY: rect.bottom });
       };
     }
     if (row.draggable) row.ondragstart = e => {
@@ -4784,5 +4941,9 @@ function fmtSize(n) {
   }
   return value.toFixed(1) + ' PB';
 }
+
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && $('.shell')?.classList.contains('mobile-nav-open')) closeMobileNav();
+});
 
 boot().catch(e => { app.innerHTML = `<pre>${esc(e.stack || e.message)}</pre>`; });

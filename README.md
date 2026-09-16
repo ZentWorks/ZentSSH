@@ -9,6 +9,7 @@ ZentSSH is a self-hosted web interface for SSH and SFTP. It gives you browser-ba
 ## Features
 
 - SSH terminals directly in the browser
+- installable PWA with a responsive smartphone interface for iOS, Android and desktop browsers
 - SFTP file manager with upload, download, editor and dual-pane transfers
 - private servers and administrator-managed shared workspaces
 - reusable SSH credentials and server templates

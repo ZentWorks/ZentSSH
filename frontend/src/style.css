@@ -601,3 +601,169 @@ body{min-height:100vh;min-height:100dvh}
 .restore-confirm input{width:auto!important;margin:2px 0 0!important;flex:0 0 auto}
 .backup-restarting{min-height:260px}
 @media(max-width:760px){.backup-stats-grid{grid-template-columns:1fr 1fr}.backup-history{flex-direction:column;gap:5px}}
+
+/* Mobile app shell + installable PWA */
+.mobile-appbar,.mobile-nav-overlay,.mobile-sidebar-close,.server-mobile-actions,.dual-mobile-switch{display:none}
+.brand-actions{display:flex;align-items:center;gap:4px;min-width:0}
+.pwa-install[hidden]{display:none!important}
+
+@media(max-width:760px){
+  :root{--mobile-appbar-height:52px;--mobile-tabs-height:44px}
+  html,body,#app{height:var(--zent-viewport-height,100dvh);min-height:0;overscroll-behavior:none}
+  body{touch-action:manipulation;background:#090e14}
+  button,.server,.folder,.tab,.file-entry,.pane-row{-webkit-tap-highlight-color:transparent}
+  button{touch-action:manipulation}
+
+  .shell{position:fixed;inset:0;width:100vw;height:var(--zent-viewport-height,100dvh);grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
+  .shell>main{width:100vw;height:var(--zent-viewport-height,100dvh);min-height:0}
+  .shell>aside{position:fixed;z-index:120;inset:0 auto 0 0;width:min(88vw,340px);height:var(--zent-viewport-height,100dvh);padding-top:env(safe-area-inset-top,0);padding-bottom:env(safe-area-inset-bottom,0);background:#0d141d;box-shadow:18px 0 50px #000b;transform:translateX(-105%);transition:transform .2s ease;will-change:transform}
+  .shell.mobile-nav-open>aside{transform:translateX(0)}
+  .mobile-nav-overlay{display:block;position:fixed;z-index:110;inset:0;width:100%;height:100%;padding:0;border:0;background:#0009;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s ease,visibility .2s ease}
+  .shell.mobile-nav-open .mobile-nav-overlay{opacity:1;visibility:visible;pointer-events:auto}
+  .brand{min-height:58px;padding:9px 10px 9px 13px;align-items:center}
+  .brand-logo{width:38px!important;height:38px!important}
+  .brand-profile{max-width:110px}
+  .mobile-sidebar-close{display:grid;width:42px;height:42px;place-items:center;border:0;border-radius:10px;background:transparent;color:#91a6ba;font-size:27px;line-height:1}
+  .mobile-sidebar-close:hover,.mobile-sidebar-close:focus-visible{background:#172331;color:#fff;outline:none}
+  .toolbar button,.asidefoot button{min-height:44px}
+  .asidefoot{padding-bottom:max(10px,env(safe-area-inset-bottom,0))}
+
+  .mobile-appbar{display:grid;grid-template-columns:44px minmax(0,1fr) 44px;align-items:center;gap:7px;flex:0 0 calc(var(--mobile-appbar-height) + env(safe-area-inset-top,0));height:calc(var(--mobile-appbar-height) + env(safe-area-inset-top,0));padding:env(safe-area-inset-top,0) max(8px,env(safe-area-inset-right,0)) 0 max(8px,env(safe-area-inset-left,0));border-bottom:1px solid #1d2935;background:#0d141d;box-shadow:0 2px 12px #0005;z-index:6}
+  .mobile-appbar-button{width:44px;height:44px;display:grid;place-items:center;padding:0;border:0;border-radius:10px;background:transparent;color:#a5bfd3}
+  .mobile-appbar-button:active,.mobile-appbar-button:focus-visible{background:#172635;color:#fff;outline:none}
+  .mobile-appbar-button svg{width:21px;height:21px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+  .mobile-app-brand{min-width:0;display:flex;align-items:center;justify-content:center;gap:8px;color:#edf7ff}
+  .mobile-app-brand img{width:31px;height:31px;object-fit:contain;filter:drop-shadow(0 4px 10px #087da044)}
+  .mobile-app-brand b{font-size:16px;letter-spacing:.01em;white-space:nowrap}
+
+  .tabs{flex:0 0 var(--mobile-tabs-height);height:var(--mobile-tabs-height);padding:0 max(5px,env(safe-area-inset-left,0));scroll-snap-type:x proximity;scrollbar-width:none;background:#0f1720}
+  .tabs::-webkit-scrollbar{display:none}
+  .tab{height:var(--mobile-tabs-height);min-width:124px;max-width:76vw;grid-template-columns:19px minmax(0,1fr) 40px;gap:6px;padding-left:9px;scroll-snap-align:center}
+  .tab-close{width:40px!important;height:40px!important;font-size:20px!important}
+  .tab-kind svg{width:17px;height:17px}
+  .workspace{min-height:0;overflow:hidden;padding-bottom:env(safe-area-inset-bottom,0)}
+  .empty{padding:24px 18px}
+  .empty h2{font-size:18px}
+  .empty p{font-size:12px;line-height:1.5}
+
+  .server{grid-template-columns:18px minmax(0,1fr) 44px;min-height:56px;margin:2px 6px;padding-top:6px;padding-bottom:6px}
+  .server-mobile-actions{display:grid;width:44px;height:44px;place-items:center;align-self:center;padding:0;border:0;border-radius:10px;background:transparent;color:#88a4b8;font-size:24px;line-height:1}
+  .server-mobile-actions:active,.server-mobile-actions:focus-visible{background:#1a2c3b;color:#fff;outline:none}
+  .folder{min-height:44px;display:flex;align-items:center}
+  .folder .manage-folder{min-width:44px;min-height:40px;margin-left:auto}
+  .tree-root-drop{min-height:44px}
+
+  .app-context-menu{left:max(8px,env(safe-area-inset-left,0))!important;right:max(8px,env(safe-area-inset-right,0))!important;top:auto!important;bottom:max(8px,env(safe-area-inset-bottom,0))!important;width:auto!important;max-height:min(72dvh,620px);overflow:auto;padding:8px;border-radius:16px;box-shadow:0 -12px 50px #000c}
+  .app-context-menu button{min-height:46px;padding:10px 11px}
+
+  .termhead{height:42px;flex:0 0 42px;padding:0 8px;gap:7px}
+  .termhead-server{min-width:0}
+  .termhead-server span,.termhead-server small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .terminal-snippet-button{width:42px!important;height:42px!important;flex:0 0 42px}
+  .terminal{padding:4px 3px 3px;overscroll-behavior:contain}
+
+  .filetopbar{min-height:52px;padding:6px 8px;gap:8px}
+  .fileidentity{gap:7px;min-width:0}
+  .fileidentity-icon{width:32px;height:32px}
+  .fileidentity strong{font-size:12.5px}
+  .fileidentity small{font-size:9.5px}
+  .filetop-actions{gap:3px}
+  .icononly.file-top-action{width:44px;height:44px;flex-basis:44px}
+  .filepathrow{grid-template-columns:1fr;padding:7px 8px;gap:6px}
+  .filepathinput{grid-template-columns:minmax(0,1fr) 44px}
+  .filepathinput button{width:44px;min-width:44px;padding:0}
+  .filepathinput button .button-icon{margin:0 auto}
+  .filepathinput button>span:last-child{display:none}
+  .file-breadcrumbs{width:100%;max-width:none;padding:2px 0}
+  .file-breadcrumbs .crumb{min-height:38px;padding:7px 5px}
+  .file-entry{min-height:54px;padding:7px 10px;gap:7px}
+  .filetoolbar-clean{padding:6px 8px}
+  .filetoolbar-left,.filetoolbar-right{gap:5px}
+  .filetoolbar-clean button{min-height:42px}
+  .filelist-head{padding-left:10px;padding-right:10px}
+
+  .dual-toolbar{height:auto;min-height:52px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px;padding:6px 8px}
+  .dual-title{display:none}
+  .dual-mobile-switch{display:grid;grid-template-columns:1fr 1fr;gap:4px;min-width:0;padding:3px;border:1px solid #213647;border-radius:10px;background:#091119}
+  .dual-mobile-switch button{min-height:38px;padding:6px 11px!important;border:0!important;background:transparent!important;color:#7890a4!important}
+  .dual-mobile-switch button.active{background:#17304a!important;color:#fff!important;box-shadow:inset 0 0 0 1px #295779}
+  #dual-close{width:44px;height:44px;padding:0!important}
+  #dual-close .button-icon{margin:auto}
+  #dual-close>span:last-child{display:none}
+  .dual-grid{display:block;min-height:0;overflow:hidden}
+  .dual-divider{display:none!important}
+  .filepane{height:100%;min-height:0!important;border:0!important}
+  .dual-files[data-mobile-pane="left"] .filepane[data-side="right"],.dual-files[data-mobile-pane="right"] .filepane[data-side="left"]{display:none}
+  .panehead{padding:7px}
+  .panehead>div{grid-template-columns:minmax(0,1fr) 44px}
+  .pane-open{width:44px;height:42px;padding:0!important}
+  .pane-open .button-icon{margin:auto}
+  .pane-open>span:last-child{display:none}
+  .pane-row{min-height:52px;padding:7px 9px}
+
+  .backdrop{align-items:flex-end;padding:0;padding-top:env(safe-area-inset-top,0)}
+  .dialog{width:100%!important;max-width:none!important;max-height:92dvh;border-width:1px 0 0;border-radius:18px 18px 0 0;padding:18px max(16px,env(safe-area-inset-right,0)) max(18px,env(safe-area-inset-bottom,0)) max(16px,env(safe-area-inset-left,0));box-shadow:0 -18px 60px #000c}
+  .dialogtitle{top:-18px;padding-top:2px}
+  .dialogtitle .iconbutton{width:44px!important;height:44px!important;display:grid!important;place-items:center!important;font-size:27px!important}
+  .settingsdialog,.fileeditordialog,.crontab-dialog,.access-users-dialog,.workspace-admin-dialog,.server-template-admin-dialog{width:100vw!important;height:var(--zent-viewport-height,100dvh)!important;max-height:none!important;border-radius:0!important;border:0!important;padding-bottom:env(safe-area-inset-bottom,0)!important}
+  .settingsheader{padding:max(14px,env(safe-area-inset-top,0)) 14px 12px}
+  .settingslayout{grid-template-rows:auto minmax(0,1fr)}
+  .settingsnav{padding:6px 8px;gap:5px;scrollbar-width:none}
+  .settingsnav::-webkit-scrollbar{display:none}
+  .settings-nav-group{display:flex!important;gap:4px!important}
+  .settings-nav-group-title{display:none}
+  .settingsnav button{min-height:42px;padding:8px 10px!important}
+  .settingscontent{padding:4px 14px max(22px,env(safe-area-inset-bottom,0))}
+  .settingssection h4{font-size:16px}
+  .formgrid{grid-template-columns:1fr}
+  .formgrid .wide{grid-column:1}
+  .formgrid>span:empty{display:none}
+  .actions{position:relative;gap:7px;flex-wrap:wrap}
+  .actions button{min-height:44px}
+  .actions.spread{align-items:stretch}
+  .actions.spread>div{flex:1;justify-content:flex-end;flex-wrap:wrap}
+  .toggle-row{min-height:50px}
+  .provider-row{align-items:flex-start;flex-direction:column}
+  .provider-row .rowactions{width:100%;display:flex;justify-content:flex-end;flex-wrap:wrap}
+  .provider-row .rowactions button{min-height:42px}
+  .sectiontitle{align-items:flex-start;flex-direction:column}
+  .sectiontitle>button{align-self:stretch;min-height:44px}
+
+  .toast{left:max(10px,env(safe-area-inset-left,0));right:max(10px,env(safe-area-inset-right,0));bottom:max(10px,env(safe-area-inset-bottom,0));max-width:none;justify-content:center;text-align:center}
+  .has-tooltip:after,.server .server-status:after{display:none!important}
+}
+
+@media(max-width:760px) and (orientation:landscape){
+  :root{--mobile-appbar-height:44px;--mobile-tabs-height:38px}
+  .mobile-appbar{grid-template-columns:40px minmax(0,1fr) 40px}
+  .mobile-appbar-button{width:40px;height:40px}
+  .mobile-app-brand img{width:27px;height:27px}
+  .tab{height:38px;grid-template-columns:18px minmax(0,1fr) 36px}
+  .tab-close{width:36px!important;height:36px!important}
+  .termhead{height:36px;flex-basis:36px}
+  .terminal-snippet-button{width:36px!important;height:36px!important;flex-basis:36px}
+}
+
+/* Touch actions that replace desktop-only context-menu gestures. */
+.file-mobile-actions,.pane-mobile-actions{display:none}
+@media(max-width:760px){
+  .auth{height:var(--zent-viewport-height,100dvh);min-height:var(--zent-viewport-height,100dvh);overflow:auto;padding:max(16px,env(safe-area-inset-top,0)) max(12px,env(safe-area-inset-right,0)) max(16px,env(safe-area-inset-bottom,0)) max(12px,env(safe-area-inset-left,0))}
+  .authcard{margin:auto}
+  .settingssection select{min-width:0;max-width:100%}
+
+  .file-entry:not(.parent-entry){grid-template-columns:minmax(0,1fr) 44px}
+  .file-entry:not(.parent-entry) .file-size,.file-entry:not(.parent-entry) .file-mode{display:none}
+  .file-mobile-actions,.pane-mobile-actions{display:grid;width:44px;height:44px;place-items:center;padding:0;border:0;border-radius:10px;background:transparent;color:#88a4b8;font-size:24px;line-height:1}
+  .file-mobile-actions:active,.file-mobile-actions:focus-visible,.pane-mobile-actions:active,.pane-mobile-actions:focus-visible{background:#1a2c3b;color:#fff;outline:none}
+
+  .pane-row:not(.parent-pane-row){grid-template-columns:28px minmax(0,1fr) 44px}
+  .pane-row:not(.parent-pane-row)>small{display:none}
+  .pane-mobile-actions{grid-column:3}
+}
+@media(max-width:760px){
+  .app-context-menu{z-index:160}
+  .file-entry.parent-entry{grid-template-columns:minmax(0,1fr)}
+  .file-entry.parent-entry>span{display:none}
+  .pane-row.parent-pane-row{grid-template-columns:28px minmax(0,1fr)}
+  .pane-row.parent-pane-row>small{display:none}
+}
