@@ -350,6 +350,73 @@ function cookieValue(name) {
   return '';
 }
 
+function looksLikeHTMLResponse(text, contentType = '') {
+  const value = String(text || '').trim();
+  const type = String(contentType || '').toLowerCase();
+  if (type.includes('text/html') || type.includes('application/xhtml+xml')) return true;
+  return /^<!doctype\s+html\b/i.test(value) || /^<html\b/i.test(value) || /<body\b[^>]*>/i.test(value) || /id=["']cf-error-details["']/i.test(value);
+}
+
+function httpFailureMessage(status) {
+  if ([502, 503, 504].includes(Number(status))) return L('Server momentan nicht erreichbar. Bitte später erneut versuchen.','Server is currently unavailable. Please try again later.');
+  if (Number(status) === 429) return L('Zu viele Anfragen. Bitte kurz warten und erneut versuchen.','Too many requests. Please wait briefly and try again.');
+  return L(`Anfrage fehlgeschlagen (HTTP ${status}).`,`Request failed (HTTP ${status}).`);
+}
+
+async function fetchSafe(url, options = {}) {
+  try {
+    return await fetch(url, options);
+  } catch (cause) {
+    const error = new Error(L('Verbindung zu ZentSSH fehlgeschlagen.','Connection to ZentSSH failed.'));
+    error.cause = cause;
+    error.network = true;
+    throw error;
+  }
+}
+
+async function readResponsePayload(response) {
+  const text = await response.text();
+  if (!text) return { data: {}, text: '', html: false };
+  const contentType = response.headers.get('Content-Type') || '';
+  const html = looksLikeHTMLResponse(text, contentType);
+  if (!html) {
+    try { return { data: JSON.parse(text), text, html: false }; } catch { /* non-JSON response */ }
+  }
+  return { data: {}, text, html };
+}
+
+function sshConnectFailureMessage(rawMessage = '') {
+  const value = String(rawMessage || '').toLowerCase();
+  if (/permission denied|unable to authenticate|authentication failed|no supported methods remain|handshake failed.*auth/.test(value)) {
+    return L('SSH-Anmeldung fehlgeschlagen. Zugangsdaten prüfen.','SSH authentication failed. Check the credentials.');
+  }
+  if (/i\/o timeout|timed out|connection refused|no route to host|network is unreachable|host is down|dial tcp|no such host|name resolution/.test(value)) {
+    return L('SSH-Server nicht erreichbar. Host, Port und Netzwerk prüfen.','SSH server is unreachable. Check host, port and network.');
+  }
+  return L('SSH-Verbindung fehlgeschlagen. Host, Port und Zugangsdaten prüfen.','SSH connection failed. Check host, port and credentials.');
+}
+
+async function responseError(response) {
+  const payload = await readResponsePayload(response);
+  const data = payload.data || {};
+  const backendMessage = typeof data.error === 'string' ? data.error.trim() : '';
+  let message = '';
+  if (data.code === 'ssh_connect_failed') {
+    message = sshConnectFailureMessage(backendMessage);
+  } else if (Number(response.status) >= 500) {
+    message = httpFailureMessage(response.status);
+  } else if (backendMessage && !looksLikeHTMLResponse(backendMessage)) {
+    message = backendMessage;
+  } else {
+    message = httpFailureMessage(response.status);
+  }
+  const error = new Error(message);
+  error.status = response.status;
+  error.data = data;
+  error.responseWasHTML = payload.html;
+  return error;
+}
+
 async function api(url, options = {}) {
   const headers = { ...(options.headers || {}) };
   const method = String(options.method || 'GET').toUpperCase();
@@ -358,32 +425,17 @@ async function api(url, options = {}) {
     const csrf = cookieValue('zentssh_csrf');
     if (csrf) headers['X-CSRF-Token'] = csrf;
   }
-  const response = await fetch(A + url, { ...options, headers });
-  const text = await response.text();
-  let data = {};
-  if (text) {
-    try { data = JSON.parse(text); } catch { data = { error: text }; }
-  }
-  if (!response.ok) {
-    const error = new Error(data.error || response.statusText || `HTTP ${response.status}`);
-    error.status = response.status;
-    error.data = data;
-    throw error;
-  }
-  return data;
+  const response = await fetchSafe(A + url, { ...options, headers });
+  if (!response.ok) throw await responseError(response);
+  return (await readResponsePayload(response)).data;
 }
 
 async function downloadAdminBackup(password) {
   const headers = { 'Content-Type': 'application/json' };
   const csrf = cookieValue('zentssh_csrf');
   if (csrf) headers['X-CSRF-Token'] = csrf;
-  const response = await fetch(`${A}/admin/backup/export`, { method: 'POST', headers, body: JSON.stringify({ password }) });
-  if (!response.ok) {
-    const text = await response.text();
-    let data = {};
-    try { data = JSON.parse(text); } catch { data = { error: text }; }
-    throw new Error(data.error || response.statusText || `HTTP ${response.status}`);
-  }
+  const response = await fetchSafe(`${A}/admin/backup/export`, { method: 'POST', headers, body: JSON.stringify({ password }) });
+  if (!response.ok) throw await responseError(response);
   const blob = await response.blob();
   const disposition = response.headers.get('Content-Disposition') || '';
   const match = disposition.match(/filename="([^"]+)"/i);
@@ -3342,11 +3394,8 @@ async function fileEditorModal(serverId, remotePath, currentPath, options = {}) 
     setButtonBusy(button, true, 'Speichere…');
     $('#editor-error').textContent = '';
     try {
-      const response = await fetch(`${A}/files/${serverId}?path=${encodeURIComponent(remotePath)}`, { method: 'PUT', body: textarea.value, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'X-CSRF-Token': cookieValue('zentssh_csrf') } });
-      if (!response.ok) {
-        const text = await response.text();
-        try { throw new Error(JSON.parse(text).error || text); } catch (parseError) { if (parseError instanceof SyntaxError) throw new Error(text || `HTTP ${response.status}`); throw parseError; }
-      }
+      const response = await fetchSafe(`${A}/files/${serverId}?path=${encodeURIComponent(remotePath)}`, { method: 'PUT', body: textarea.value, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'X-CSRF-Token': cookieValue('zentssh_csrf') } });
+      if (!response.ok) throw await responseError(response);
       dirty = false;
       createdNew = false;
       $('#editor-status').textContent = 'Gespeichert';
