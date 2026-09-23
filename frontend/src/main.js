@@ -38,6 +38,41 @@ const state = {
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
+function currentServerForTab(tab, fallback = null) {
+  if (!tab) return fallback;
+  return state.servers.find(server => Number(server.id) === Number(tab.serverId)) || fallback || tab.serverSnapshot || null;
+}
+
+function syncDocumentTitle() {
+  const tab = state.tabs.find(item => item.id === state.active);
+  const serverName = tab?.type === 'terminal' ? (currentServerForTab(tab)?.name || tab.name) : '';
+  document.title = serverName ? `ZentSSH - ${serverName}` : 'ZentSSH';
+}
+
+function focusTerminalIfActive(tab) {
+  if (!tab?.term) return;
+  requestAnimationFrame(() => {
+    if (state.active !== tab.id || tab.closing) return;
+    try { tab.term.focus(); } catch { /* terminal may be between renders */ }
+  });
+}
+
+function serverHasOpenTerminal(serverId) {
+  return state.tabs.some(tab => (tab.type || 'terminal') === 'terminal' && Number(tab.serverId) === Number(serverId) && !tab.closing);
+}
+
+function serverTerminalIsReconnecting(serverId) {
+  return state.tabs.some(tab => (tab.type || 'terminal') === 'terminal' && Number(tab.serverId) === Number(serverId) && !tab.closing && tab.reconnectNotice);
+}
+
+function syncServerTerminalHighlights() {
+  $$('.server[data-id]').forEach(row => {
+    const serverId = Number(row.dataset.id || 0);
+    row.classList.toggle('has-open-terminal', serverHasOpenTerminal(serverId));
+    row.classList.toggle('terminal-reconnecting', serverTerminalIsReconnecting(serverId));
+  });
+}
+
 let deferredInstallPrompt = null;
 
 function isStandaloneApp() {
@@ -668,6 +703,7 @@ async function loadWorkspace() {
   state.serverTemplates = serverTemplates || [];
   if (previousWorkspace > 0 && !state.workspaces.some(item => Number(item.id) === previousWorkspace)) state.activeWorkspaceId = 0;
   await loadWorkspaceScope(state.activeWorkspaceId);
+  syncDocumentTitle();
 }
 
 async function switchWorkspace(workspaceId, options = {}) {
@@ -780,7 +816,7 @@ function restoreTrackedSessions() {
   for (const live of restorable) {
     const server = state.servers.find(s => s.id === live.serverId) || { id: live.serverId || 0, name: live.serverName, host: live.host, username: live.username, port: live.port || 22, color: '#35a4ff' };
     const tid = `t${Date.now()}${Math.random().toString(16).slice(2, 7)}`;
-    state.tabs.push({ id: tid, type: 'terminal', name: live.serverName || server.name, serverId: live.serverId, sessionId: live.id, reconnectDelay: 750, serverSnapshot: server });
+    state.tabs.push({ id: tid, type: 'terminal', name: live.serverName || server.name, serverId: live.serverId, sessionId: live.id, reconnectDelay: 750, serverSnapshot: { ...server } });
   }
   // Remove markers for sessions that no longer exist server-side.
   const existing = new Set(state.liveSessions.map(s => s.id));
@@ -890,7 +926,7 @@ function renderTree() {
     .map(s => {
       const canDrag = permissions.canEdit && s.canEdit !== false;
       const inherited = s.templateId ? `<span class="server-template-mark" data-tooltip="${esc(L('Infrastruktur wird von einer Server-Vorlage geerbt','Infrastructure is inherited from a server template'))}">↻</span>` : '';
-      return `<div class="server ${canDrag ? 'can-drag' : ''} ${Number(state.selectedServerId) === Number(s.id) ? 'selected' : ''}" data-id="${s.id}" style="--depth:${depth}" tabindex="0" aria-selected="${Number(state.selectedServerId) === Number(s.id) ? 'true' : 'false'}">
+      return `<div class="server ${canDrag ? 'can-drag' : ''} ${Number(state.selectedServerId) === Number(s.id) ? 'selected' : ''} ${serverHasOpenTerminal(s.id) ? 'has-open-terminal' : ''} ${serverTerminalIsReconnecting(s.id) ? 'terminal-reconnecting' : ''}" data-id="${s.id}" style="--depth:${depth}" tabindex="0" aria-selected="${Number(state.selectedServerId) === Number(s.id) ? 'true' : 'false'}">
       <div class="server-indicators"><span class="server-status ${esc(state.serverStatus[s.id]?.status || 'unknown')}" data-tooltip="${esc(serverStatusLabel(state.serverStatus[s.id]?.status || 'unknown'))}" aria-label="${esc(serverStatusLabel(state.serverStatus[s.id]?.status || 'unknown'))}"></span>${inherited}</div>
       <div class="server-meta"><strong>${esc(s.name)}</strong><small>${esc(s.username)}@${esc(s.host)}:${Number(s.port || 22)}</small></div>
       <button class="server-mobile-actions" type="button" aria-label="${esc(L('Serveraktionen','Server actions'))}">⋮</button>
@@ -1301,6 +1337,8 @@ function tabIcon(type) {
 }
 
 function renderTabs() {
+  syncDocumentTitle();
+  syncServerTerminalHighlights();
   const tabs = $('#tabs');
   if (!tabs) return;
   tabs.innerHTML = state.tabs.map(t => {
@@ -2406,6 +2444,7 @@ async function interceptTerminalCommand(tab, server, command, enterData) {
 
 function handleTerminalData(tab, server, data) {
   if (!tab || tab.interceptPending) return;
+  server = currentServerForTab(tab, server);
   if (data === '\r' || data === '\n') {
     const command = terminalCommandForEnter(tab);
     const canIntercept = isInterceptableTerminalCommand(command);
@@ -2435,7 +2474,7 @@ function startTerminal(tid, server) {
     term.open(element);
     fit.fit();
     tab.term = term; tab.fit = fit;
-    term.onData(data => handleTerminalData(tab, server, data));
+    term.onData(data => handleTerminalData(tab, currentServerForTab(tab, server), data));
     term.onBinary(data => {
       if (tab.ws?.readyState !== WebSocket.OPEN) return;
       const bytes = Uint8Array.from(data, character => character.charCodeAt(0) & 0xff);
@@ -2448,6 +2487,7 @@ function startTerminal(tid, server) {
   } else {
     tab.fit?.fit();
   }
+  focusTerminalIfActive(tab);
   if (server?.id && !tab.homePrefetchStarted) {
     tab.homePrefetchStarted = true;
     ensureTerminalHome(tab, server).catch(() => { tab.homePrefetchStarted = false; });
@@ -2467,6 +2507,8 @@ function connectTerminal(tab, server) {
     tab.reconnectNotice = false;
     tab.fit?.fit();
     ws.send(JSON.stringify({ type: 'resize', cols: tab.term.cols, rows: tab.term.rows }));
+    syncServerTerminalHighlights();
+    focusTerminalIfActive(tab);
   };
   ws.onmessage = event => {
     if (typeof event.data === 'string') {
@@ -2491,6 +2533,7 @@ function connectTerminal(tab, server) {
     if (!tab.reconnectNotice) {
       tab.term.write('\r\n\x1b[33m[Verbindung unterbrochen. Wiederverbinden…]\x1b[0m\r\n');
       tab.reconnectNotice = true;
+      syncServerTerminalHighlights();
     }
     const delay = Math.min(tab.reconnectDelay || 750, 10000);
     tab.reconnectDelay = Math.min(delay * 1.7, 10000);
@@ -2527,6 +2570,7 @@ function activate(id) {
   paintTerminal(id, server);
   if (tab.term) {
     tab.fit.fit();
+    focusTerminalIfActive(tab);
     if (!tab.ws || tab.ws.readyState === WebSocket.CLOSED) connectTerminal(tab, server);
   } else startTerminal(id, server);
 }

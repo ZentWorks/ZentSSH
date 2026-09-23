@@ -85,3 +85,15 @@ func TestParseDurationAllowZeroUnlimited(t *testing.T) {
 		t.Fatalf("off parsed as %s", got)
 	}
 }
+
+func TestWebSocketHeartbeatWindowAllowsMultiplePings(t *testing.T) {
+	if websocketPingInterval <= 0 {
+		t.Fatal("websocket ping interval must be positive")
+	}
+	if websocketReadTimeout < 2*websocketPingInterval {
+		t.Fatalf("websocket read timeout %s is too short for ping interval %s", websocketReadTimeout, websocketPingInterval)
+	}
+	if websocketWriteTimeout <= 0 || websocketWriteTimeout >= websocketReadTimeout {
+		t.Fatalf("invalid websocket write timeout %s for read timeout %s", websocketWriteTimeout, websocketReadTimeout)
+	}
+}

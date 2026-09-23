@@ -17,6 +17,12 @@ import (
 	"zentssh.local/backend/internal/sshx"
 )
 
+const (
+	websocketPingInterval = 25 * time.Second
+	websocketReadTimeout  = 75 * time.Second
+	websocketWriteTimeout = 10 * time.Second
+)
+
 type LiveSession struct {
 	ID         string
 	UserID     int64
@@ -319,15 +325,22 @@ func (att *sessionAttachment) closeWithReason(reason string) {
 }
 
 func (a *App) attachmentWriter(att *sessionAttachment) {
+	ticker := time.NewTicker(websocketPingInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-att.done:
 			return
+		case <-ticker.C:
+			if err := att.ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second)); err != nil {
+				att.close()
+				return
+			}
 		case data := <-att.send:
 			if len(data) == 0 {
 				continue
 			}
-			_ = att.ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			_ = att.ws.SetWriteDeadline(time.Now().Add(websocketWriteTimeout))
 			if err := att.ws.WriteMessage(websocket.BinaryMessage, data); err != nil {
 				att.close()
 				return
@@ -561,6 +574,10 @@ func (a *App) wsSSH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ws.SetReadLimit(1 << 20)
+	_ = ws.SetReadDeadline(time.Now().Add(websocketReadTimeout))
+	ws.SetPongHandler(func(string) error {
+		return ws.SetReadDeadline(time.Now().Add(websocketReadTimeout))
+	})
 	att, err := a.attachSession(s, ws)
 	if err != nil {
 		_ = ws.Close()
@@ -572,8 +589,12 @@ func (a *App) wsSSH(w http.ResponseWriter, r *http.Request) {
 	for {
 		mt, b, err := ws.ReadMessage()
 		if err != nil {
+			if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
+				log.Printf("websocket attachment lost: server_id=%d client=%q error=%q", s.ServerID, a.clientIP(r), err.Error())
+			}
 			return
 		}
+		_ = ws.SetReadDeadline(time.Now().Add(websocketReadTimeout))
 		if mt == websocket.TextMessage {
 			var m struct {
 				Type string `json:"type"`

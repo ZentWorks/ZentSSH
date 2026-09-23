@@ -101,6 +101,10 @@ body{min-height:100vh;min-height:100dvh}
 .server{display:grid;grid-template-columns:18px minmax(0,1fr);grid-template-rows:auto;align-items:center;column-gap:8px;min-height:50px;margin:2px 7px;padding:7px 9px 7px calc(8px + var(--depth,0)*12px);border:1px solid transparent;border-radius:10px;user-select:none;-webkit-user-select:none;outline:none}
 .server:hover{background:#121e29;border-color:#1d3243}
 .server.selected{background:#142637;border-color:#29455d}
+.server.has-open-terminal{background:linear-gradient(90deg,rgba(51,157,100,.13),rgba(51,157,100,.045) 46%,transparent 82%);box-shadow:inset 2px 0 0 #45b878}
+.server.has-open-terminal:hover{background:linear-gradient(90deg,rgba(51,157,100,.18),rgba(51,157,100,.07) 48%,#121e29 92%);border-color:#244437}
+.server.has-open-terminal.selected{background:linear-gradient(90deg,rgba(51,157,100,.2),rgba(51,157,100,.075) 46%,#142637 90%);border-color:#315444;box-shadow:inset 2px 0 0 #55c987}
+.server.has-open-terminal.terminal-reconnecting{box-shadow:inset 2px 0 0 #d0a94e;background:linear-gradient(90deg,rgba(191,145,49,.13),rgba(191,145,49,.035) 48%,transparent 82%)}
 .server:focus-visible{box-shadow:0 0 0 2px #2b7eb455 inset}
 .server.can-drag{cursor:grab;touch-action:pan-y}
 .server.can-drag:active,.server.dragging{cursor:grabbing}
