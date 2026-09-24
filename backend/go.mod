@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/gorilla/websocket v1.5.3
-	github.com/pkg/sftp v1.13.7
+	github.com/pkg/sftp v1.13.11
 	golang.org/x/crypto v0.57.0
 	modernc.org/sqlite v1.34.5
 )
