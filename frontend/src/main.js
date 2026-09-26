@@ -2733,6 +2733,12 @@ function createFilePanel(tab, server) {
     } catch (e) { showToast(e.message, true); }
   };
   const body = $('[data-file-body]', panel);
+  bindLocalUploadDropZone(panel, () => ({
+    serverId: Number(tab.serverId),
+    currentPath: tab.filePath || '.',
+    serverName: knownServer(tab.serverId)?.name || tab.name || '',
+    onRefresh: () => refreshFileDirectory(tab, tab.filePath || '.'),
+  }));
   panel.oncontextmenu = event => {
     if (!event.target.closest('[data-file-body]') && event.target !== panel) return;
     if (event.target.closest('.file-entry,button,input,select,textarea,label,a')) return;
@@ -3017,25 +3023,268 @@ function remoteBreadcrumbs(remotePath) {
   return out.join('');
 }
 
-function uploadRemoteFile(serverId, remotePath, file, panel = null) {
+function uploadRemoteFile(serverId, remotePath, file, panel = null, options = {}) {
   return new Promise((resolve, reject) => {
-    const root = panel?.querySelector('[data-upload-progress]') || $('#upload-progress'); const bar = root?.querySelector('i'); const label = root?.querySelector('span');
-    if (root) root.hidden = false;
+    const root = panel?.querySelector('[data-upload-progress]') || $('#upload-progress');
+    const bar = root?.querySelector('i');
+    const label = root?.querySelector('span');
+    if (root && !options.externalProgress) root.hidden = false;
     const xhr = new XMLHttpRequest();
     xhr.open('PUT', `${A}/files/${serverId}?path=${encodeURIComponent(remotePath)}`);
-    const csrf = cookieValue('zentssh_csrf'); if (csrf) xhr.setRequestHeader('X-CSRF-Token', csrf);
+    const csrf = cookieValue('zentssh_csrf');
+    if (csrf) xhr.setRequestHeader('X-CSRF-Token', csrf);
     xhr.upload.onprogress = event => {
-      if (!event.lengthComputable) return;
-      const pct = Math.max(0, Math.min(100, Math.round(event.loaded / event.total * 100)));
-      if (bar) bar.style.width = `${pct}%`; if (label) label.textContent = `Upload ${pct}% · ${fmtSize(event.loaded)} / ${fmtSize(event.total)}`;
+      const loaded = Number(event.loaded || 0);
+      const total = event.lengthComputable ? Number(event.total || file?.size || 0) : Number(file?.size || 0);
+      options.onProgress?.({ loaded, total, file, remotePath });
+      if (!event.lengthComputable || options.externalProgress) return;
+      const pct = Math.max(0, Math.min(100, Math.round(loaded / Math.max(1, total) * 100)));
+      if (bar) bar.style.width = `${pct}%`;
+      if (label) label.textContent = `Upload ${pct}% · ${fmtSize(loaded)} / ${fmtSize(total)}`;
     };
-    xhr.onerror = () => { if (root) root.hidden = true; reject(new Error('Upload-Verbindung fehlgeschlagen.')); };
+    xhr.onerror = () => {
+      if (root && !options.externalProgress) root.hidden = true;
+      reject(new Error(L('Upload-Verbindung fehlgeschlagen.','Upload connection failed.')));
+    };
     xhr.onload = () => {
-      if (root) root.hidden = true;
-      if (xhr.status >= 200 && xhr.status < 300) resolve();
-      else { let msg = xhr.responseText || `HTTP ${xhr.status}`; try { msg = JSON.parse(msg).error || msg; } catch {} reject(new Error(msg)); }
+      if (root && !options.externalProgress) root.hidden = true;
+      if (xhr.status >= 200 && xhr.status < 300) { resolve(); return; }
+      const raw = String(xhr.responseText || '');
+      let backendMessage = '';
+      try { backendMessage = String(JSON.parse(raw)?.error || '').trim(); } catch { /* non-JSON response */ }
+      let message;
+      if (xhr.status >= 500) message = httpFailureMessage(xhr.status);
+      else if (backendMessage && !looksLikeHTMLResponse(backendMessage)) message = backendMessage;
+      else if (raw && !looksLikeHTMLResponse(raw, xhr.getResponseHeader('Content-Type') || '')) message = raw.slice(0, 300);
+      else message = httpFailureMessage(xhr.status);
+      reject(new Error(message));
     };
     xhr.send(file);
+  });
+}
+
+const LOCAL_DROP_UPLOAD_CONCURRENCY = 2;
+const LOCAL_DROP_MAX_FILES = 5000;
+
+function dataTransferHasType(dataTransfer, type) {
+  return [...(dataTransfer?.types || [])].includes(type);
+}
+
+function isLocalFileDrag(dataTransfer) {
+  return dataTransferHasType(dataTransfer, 'Files') && !dataTransferHasType(dataTransfer, 'application/x-zentssh-transfer');
+}
+
+function safeLocalDropPath(rawPath) {
+  const parts = String(rawPath || '').replace(/\\/g, '/').split('/').filter(Boolean);
+  if (!parts.length || parts.some(part => part === '.' || part === '..' || part.includes('\0'))) throw new Error(L('Ungültiger lokaler Dateipfad.','Invalid local file path.'));
+  return parts.join('/');
+}
+
+function ensureDropFileLimit(files) {
+  if (files.length > LOCAL_DROP_MAX_FILES) throw new Error(L(`Maximal ${LOCAL_DROP_MAX_FILES} Dateien pro Drag-&-Drop-Upload.`,`A maximum of ${LOCAL_DROP_MAX_FILES} files can be uploaded per drag and drop.`));
+}
+
+async function collectFileSystemHandle(handle, prefix, files, directories) {
+  if (!handle) return;
+  const relativePath = safeLocalDropPath(prefix ? `${prefix}/${handle.name}` : handle.name);
+  if (handle.kind === 'file') {
+    files.push({ file: await handle.getFile(), relativePath });
+    ensureDropFileLimit(files);
+    return;
+  }
+  if (handle.kind !== 'directory') return;
+  directories.add(relativePath);
+  for await (const child of handle.values()) await collectFileSystemHandle(child, relativePath, files, directories);
+}
+
+function readLegacyDirectoryEntries(reader) {
+  return new Promise((resolve, reject) => {
+    const entries = [];
+    const next = () => reader.readEntries(batch => {
+      if (!batch.length) { resolve(entries); return; }
+      entries.push(...batch);
+      next();
+    }, reject);
+    next();
+  });
+}
+
+async function collectLegacyEntry(entry, prefix, files, directories) {
+  if (!entry) return;
+  const relativePath = safeLocalDropPath(prefix ? `${prefix}/${entry.name}` : entry.name);
+  if (entry.isFile) {
+    const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+    files.push({ file, relativePath });
+    ensureDropFileLimit(files);
+    return;
+  }
+  if (!entry.isDirectory) return;
+  directories.add(relativePath);
+  const children = await readLegacyDirectoryEntries(entry.createReader());
+  for (const child of children) await collectLegacyEntry(child, relativePath, files, directories);
+}
+
+function addParentDirectories(relativePath, directories) {
+  const parts = safeLocalDropPath(relativePath).split('/');
+  parts.pop();
+  let current = '';
+  for (const part of parts) {
+    current = current ? `${current}/${part}` : part;
+    directories.add(current);
+  }
+}
+
+async function collectLocalDrop(dataTransfer) {
+  const files = [];
+  const directories = new Set();
+  const items = [...(dataTransfer?.items || [])].filter(item => item.kind === 'file');
+  let collected = false;
+
+  if (items.length && items.some(item => typeof item.getAsFileSystemHandle === 'function')) {
+    const handles = await Promise.all(items.map(async item => {
+      try { return await item.getAsFileSystemHandle(); } catch { return null; }
+    }));
+    if (handles.some(Boolean)) {
+      collected = true;
+      for (const handle of handles) if (handle) await collectFileSystemHandle(handle, '', files, directories);
+    }
+  }
+
+  if (!collected && items.length && items.some(item => typeof item.webkitGetAsEntry === 'function')) {
+    const entries = items.map(item => item.webkitGetAsEntry?.()).filter(Boolean);
+    if (entries.length) {
+      collected = true;
+      for (const entry of entries) await collectLegacyEntry(entry, '', files, directories);
+    }
+  }
+
+  if (!collected) {
+    for (const file of [...(dataTransfer?.files || [])]) {
+      const relativePath = safeLocalDropPath(file.webkitRelativePath || file.name);
+      files.push({ file, relativePath });
+      addParentDirectories(relativePath, directories);
+      ensureDropFileLimit(files);
+    }
+  }
+
+  for (const item of files) addParentDirectories(item.relativePath, directories);
+  return {
+    files,
+    directories: [...directories].sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b)),
+  };
+}
+
+function ensureLocalDropOverlay(target) {
+  let overlay = target?.querySelector(':scope > .local-drop-overlay');
+  if (overlay || !target) return overlay;
+  overlay = document.createElement('div');
+  overlay.className = 'local-drop-overlay';
+  overlay.innerHTML = `<span class="local-drop-overlay-icon">${actionIcon('upload')}</span><b></b><small></small>`;
+  target.appendChild(overlay);
+  return overlay;
+}
+
+function setLocalDropOverlay(target, mode = '', title = '', detail = '') {
+  if (!target) return;
+  const overlay = ensureLocalDropOverlay(target);
+  target.classList.toggle('local-file-drop-target', mode === 'drag');
+  target.classList.toggle('local-file-uploading', mode === 'upload');
+  overlay?.classList.toggle('visible', Boolean(mode));
+  if ($('b', overlay)) $('b', overlay).textContent = title;
+  if ($('small', overlay)) $('small', overlay).textContent = detail;
+}
+
+function clearLocalDropOverlay(target) { setLocalDropOverlay(target); }
+
+async function uploadLocalDrop({ dataTransfer, target, serverId, currentPath, onRefresh }) {
+  setLocalDropOverlay(target, 'upload', L('Upload wird vorbereitet…','Preparing upload…'), currentPath || '.');
+  let dropped;
+  try {
+    dropped = await collectLocalDrop(dataTransfer);
+    if (!dropped.files.length && !dropped.directories.length) throw new Error(L('Keine Dateien zum Hochladen gefunden.','No files found to upload.'));
+
+    for (const relativeDir of dropped.directories) {
+      await api(`/files/${serverId}`, { method: 'POST', body: JSON.stringify({ action: 'mkdir', path: joinRemotePath(currentPath, relativeDir) }) });
+    }
+
+    const totalBytes = dropped.files.reduce((sum, item) => sum + Number(item.file?.size || 0), 0);
+    const loadedByIndex = new Map();
+    const failures = [];
+    let completed = 0;
+    let nextIndex = 0;
+    const renderProgress = (activeName = '') => {
+      const loaded = [...loadedByIndex.values()].reduce((sum, value) => sum + value, 0);
+      const pct = totalBytes > 0 ? Math.min(100, Math.round(loaded / totalBytes * 100)) : (dropped.files.length ? Math.round(completed / dropped.files.length * 100) : 100);
+      setLocalDropOverlay(target, 'upload', `${L('Upload','Upload')} ${completed}/${dropped.files.length} · ${pct}%`, activeName || currentPath || '.');
+    };
+    renderProgress();
+
+    const worker = async () => {
+      while (true) {
+        const index = nextIndex++;
+        if (index >= dropped.files.length) return;
+        const item = dropped.files[index];
+        const remotePath = joinRemotePath(currentPath, item.relativePath);
+        loadedByIndex.set(index, 0);
+        try {
+          await uploadRemoteFile(serverId, remotePath, item.file, null, {
+            externalProgress: true,
+            onProgress: ({ loaded }) => { loadedByIndex.set(index, loaded); renderProgress(item.relativePath); },
+          });
+          loadedByIndex.set(index, Number(item.file?.size || 0));
+        } catch (error) {
+          failures.push({ path: item.relativePath, error });
+        } finally {
+          completed += 1;
+          renderProgress(item.relativePath);
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: Math.min(LOCAL_DROP_UPLOAD_CONCURRENCY, Math.max(1, dropped.files.length)) }, () => worker()));
+    await onRefresh?.();
+
+    const succeeded = dropped.files.length - failures.length;
+    if (failures.length) {
+      const sample = failures.slice(0, 3).map(item => item.path).join(', ');
+      showToast(`${succeeded} ${L('Dateien hochgeladen','files uploaded')}, ${failures.length} ${L('fehlgeschlagen','failed')}${sample ? `: ${sample}` : ''}`, true);
+    } else if (!dropped.files.length && dropped.directories.length) {
+      showToast(dropped.directories.length === 1 ? L('Ordner angelegt.','Folder created.') : `${dropped.directories.length} ${L('Ordner angelegt.','folders created.')}`);
+    } else {
+      showToast(dropped.files.length === 1 ? `${dropped.files[0].relativePath} ${L('hochgeladen.','uploaded.')}` : `${dropped.files.length} ${L('Dateien hochgeladen.','files uploaded.')}`);
+    }
+  } catch (error) {
+    showToast(error.message || L('Upload fehlgeschlagen.','Upload failed.'), true);
+  } finally {
+    clearLocalDropOverlay(target);
+  }
+}
+
+function bindLocalUploadDropZone(target, getContext) {
+  if (!target || target.dataset.localUploadDropBound === '1') return;
+  target.dataset.localUploadDropBound = '1';
+  target.addEventListener('dragenter', event => {
+    if (!isLocalFileDrag(event.dataTransfer)) return;
+    event.preventDefault();
+    const context = getContext();
+    setLocalDropOverlay(target, 'drag', L('Hier ablegen zum Hochladen','Drop here to upload'), `${context.serverName || ''}${context.currentPath ? ` · ${context.currentPath}` : ''}`);
+  });
+  target.addEventListener('dragover', event => {
+    if (!isLocalFileDrag(event.dataTransfer)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    const context = getContext();
+    setLocalDropOverlay(target, 'drag', L('Hier ablegen zum Hochladen','Drop here to upload'), `${context.serverName || ''}${context.currentPath ? ` · ${context.currentPath}` : ''}`);
+  });
+  target.addEventListener('dragleave', event => {
+    if (!target.contains(event.relatedTarget)) clearLocalDropOverlay(target);
+  });
+  target.addEventListener('drop', event => {
+    if (!isLocalFileDrag(event.dataTransfer)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const context = getContext();
+    uploadLocalDrop({ dataTransfer: event.dataTransfer, target, ...context });
   });
 }
 
@@ -3503,6 +3752,16 @@ async function openDualFiles(leftServerId, rightServerId = null, leftPath = '.',
       } catch (e) { showToast(e.message, true); }
     };
     const paneBody = $('.pane-body', pane);
+    bindLocalUploadDropZone(pane, () => {
+      const targetServerId = Number($('.pane-server', pane).value);
+      const currentPath = $('.pane-path', pane).value || '.';
+      return {
+        serverId: targetServerId,
+        currentPath,
+        serverName: knownServer(targetServerId)?.name || '',
+        onRefresh: () => loadDualPane(pane, targetServerId, currentPath),
+      };
+    });
     paneBody.oncontextmenu = event => {
       if (event.target.closest('.pane-row,button,input,select,textarea,label,a')) return;
       event.preventDefault();
@@ -3510,9 +3769,14 @@ async function openDualFiles(leftServerId, rightServerId = null, leftPath = '.',
       showDualBackgroundContextMenu(event, pane, canTransfer);
     };
     if (canTransfer) {
-      pane.ondragover = e => { e.preventDefault(); pane.classList.add('drop-target'); };
+      pane.ondragover = e => {
+        if (isLocalFileDrag(e.dataTransfer)) return;
+        e.preventDefault();
+        pane.classList.add('drop-target');
+      };
       pane.ondragleave = e => { if (!pane.contains(e.relatedTarget)) pane.classList.remove('drop-target'); };
       pane.ondrop = async e => {
+        if (isLocalFileDrag(e.dataTransfer)) return;
         e.preventDefault(); pane.classList.remove('drop-target');
         const payload = readTransferDrag(e);
         if (!payload) return;
@@ -3599,9 +3863,13 @@ async function loadDualPane(pane, serverId, path = '.') {
       e.dataTransfer.setData('text/plain', row.dataset.path);
     };
     if (isDir) {
-      row.ondragover = e => { e.preventDefault(); e.stopPropagation(); row.classList.add('drop-row'); };
+      row.ondragover = e => {
+        if (isLocalFileDrag(e.dataTransfer)) return;
+        e.preventDefault(); e.stopPropagation(); row.classList.add('drop-row');
+      };
       row.ondragleave = () => row.classList.remove('drop-row');
       row.ondrop = async e => {
+        if (isLocalFileDrag(e.dataTransfer)) return;
         e.preventDefault(); e.stopPropagation(); row.classList.remove('drop-row');
         const payload = readTransferDrag(e);
         if (!payload) return;
