@@ -88,13 +88,56 @@ function isMobileLayout() {
   return window.matchMedia?.('(max-width: 760px)').matches === true;
 }
 
-function refitActiveTerminal(delay = 0) {
-  const run = () => {
-    const tab = state.tabs.find(item => item.id === state.active && item.type === 'terminal');
-    try { tab?.fit?.fit(); } catch { /* terminal may be between renders */ }
+function terminalGeometryPass(tab, refresh = false) {
+  if (!tab?.fit || !tab.term || tab.closing || state.active !== tab.id || !tab.termElement?.isConnected) return;
+  try {
+    tab.fit.fit();
+    if (refresh && tab.term.rows > 0) tab.term.refresh(0, Math.max(0, tab.term.rows - 1));
+  } catch { /* terminal may be between renders */ }
+}
+
+function scheduleTerminalGeometrySync(tab, delay = 0, secondPass = false) {
+  if (!tab || tab.closing) return;
+  clearTimeout(tab.geometryTimer);
+  const run = () => requestAnimationFrame(() => {
+    terminalGeometryPass(tab, true);
+    if (secondPass && !tab.closing) tab.geometryTimer = setTimeout(() => terminalGeometryPass(tab, true), 90);
+  });
+  if (delay > 0) tab.geometryTimer = setTimeout(run, delay);
+  else run();
+}
+
+function removeTerminalDPRWatcher(tab) {
+  const media = tab?.dprMedia;
+  const handler = tab?.dprMediaHandler;
+  if (media && handler) {
+    if (typeof media.removeEventListener === 'function') media.removeEventListener('change', handler);
+    else if (typeof media.removeListener === 'function') media.removeListener(handler);
+  }
+  if (tab) { tab.dprMedia = null; tab.dprMediaHandler = null; }
+}
+
+function installTerminalDPRWatcher(tab) {
+  if (!tab || typeof window.matchMedia !== 'function') return;
+  removeTerminalDPRWatcher(tab);
+  const dpr = Math.max(0.1, Number(window.devicePixelRatio) || 1);
+  tab.lastDevicePixelRatio = dpr;
+  const media = window.matchMedia(`(resolution: ${dpr}dppx)`);
+  const handler = () => {
+    if (tab.closing) return;
+    installTerminalDPRWatcher(tab);
+    scheduleTerminalGeometrySync(tab, 0, true);
   };
-  if (delay > 0) setTimeout(run, delay);
-  else requestAnimationFrame(run);
+  tab.dprMedia = media;
+  tab.dprMediaHandler = handler;
+  if (typeof media.addEventListener === 'function') media.addEventListener('change', handler);
+  else if (typeof media.addListener === 'function') media.addListener(handler);
+}
+
+function refitActiveTerminal(delay = 0) {
+  const tab = state.tabs.find(item => item.id === state.active && item.type === 'terminal');
+  if (!tab) return;
+  scheduleTerminalGeometrySync(tab, delay, true);
 }
 
 function updateVisualViewport() {
@@ -158,6 +201,8 @@ window.addEventListener('appinstalled', () => {
 window.addEventListener('resize', updateVisualViewport, { passive: true });
 window.visualViewport?.addEventListener('resize', updateVisualViewport, { passive: true });
 window.visualViewport?.addEventListener('scroll', updateVisualViewport, { passive: true });
+window.addEventListener('focus', () => refitActiveTerminal(0), { passive: true });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refitActiveTerminal(0); });
 window.matchMedia?.('(max-width: 760px)').addEventListener?.('change', event => {
   if (!event.matches) closeMobileNav();
   updateVisualViewport();
@@ -432,13 +477,24 @@ function sshConnectFailureMessage(rawMessage = '') {
   return L('SSH-Verbindung fehlgeschlagen. Host, Port und Zugangsdaten prüfen.','SSH connection failed. Check host, port and credentials.');
 }
 
+function filePermissionFailureMessage(code) {
+  if (code === 'file_write_forbidden') return L('Schreiben nicht möglich. Keine Berechtigung für diese Datei oder den Zielordner.','Writing is not possible. You do not have permission for this file or destination folder.');
+  if (code === 'file_delete_forbidden') return L('Löschen nicht möglich. Keine Berechtigung für diese Datei oder den Ordner.','Deleting is not possible. You do not have permission for this file or folder.');
+  if (code === 'file_read_forbidden') return L('Lesen nicht möglich. Keine Berechtigung für diese Datei oder den Ordner.','Reading is not possible. You do not have permission for this file or folder.');
+  if (code === 'file_operation_forbidden') return L('Vorgang nicht möglich. Keine ausreichende Berechtigung auf dem SSH-Server.','Operation is not possible. You do not have sufficient permission on the SSH server.');
+  return '';
+}
+
 async function responseError(response) {
   const payload = await readResponsePayload(response);
   const data = payload.data || {};
   const backendMessage = typeof data.error === 'string' ? data.error.trim() : '';
   let message = '';
+  const permissionMessage = filePermissionFailureMessage(data.code);
   if (data.code === 'ssh_connect_failed') {
     message = sshConnectFailureMessage(backendMessage);
+  } else if (permissionMessage) {
+    message = permissionMessage;
   } else if (Number(response.status) >= 500) {
     message = httpFailureMessage(response.status);
   } else if (backendMessage && !looksLikeHTMLResponse(backendMessage)) {
@@ -2489,9 +2545,16 @@ function startTerminal(tid, server) {
       tab.ws.send(bytes);
     });
     term.onResize(size => { if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type: 'resize', cols: size.cols, rows: size.rows })); });
-    const resize = () => { if (state.active === tid) fit.fit(); };
+    const resize = () => { if (state.active === tid) scheduleTerminalGeometrySync(tab, 0, true); };
     window.addEventListener('resize', resize, { passive: true });
     tab.resize = resize;
+    if (typeof ResizeObserver === 'function') {
+      tab.resizeObserver = new ResizeObserver(() => {
+        if (state.active === tid) scheduleTerminalGeometrySync(tab, 0, false);
+      });
+      tab.resizeObserver.observe(element);
+    }
+    installTerminalDPRWatcher(tab);
   } else {
     tab.fit?.fit();
   }
@@ -2513,7 +2576,7 @@ function connectTerminal(tab, server) {
   ws.onopen = () => {
     tab.reconnectDelay = 750;
     tab.reconnectNotice = false;
-    tab.fit?.fit();
+    scheduleTerminalGeometrySync(tab, 0, true);
     ws.send(JSON.stringify({ type: 'resize', cols: tab.term.cols, rows: tab.term.rows }));
     syncServerTerminalHighlights();
     focusTerminalIfActive(tab);
@@ -2577,7 +2640,7 @@ function activate(id) {
   if (!server) return;
   paintTerminal(id, server);
   if (tab.term) {
-    tab.fit.fit();
+    scheduleTerminalGeometrySync(tab, 0, true);
     focusTerminalIfActive(tab);
     if (!tab.ws || tab.ws.readyState === WebSocket.CLOSED) connectTerminal(tab, server);
   } else startTerminal(id, server);
@@ -2597,6 +2660,9 @@ function closeTab(id, deleteRemote = true) {
       if (deleteRemote) api(`/sessions/${encodeURIComponent(tab.sessionId)}`, { method: 'DELETE' }).catch(() => {});
     }
     if (tab.resize) window.removeEventListener('resize', tab.resize);
+    tab.resizeObserver?.disconnect();
+    removeTerminalDPRWatcher(tab);
+    clearTimeout(tab.geometryTimer);
     tab.term?.dispose();
   }
   state.tabs.splice(index, 1);
@@ -2861,7 +2927,7 @@ async function refreshFileDirectory(tab, path = '.', options = {}) {
   if (body) {
     body.innerHTML = parentRow + (sortedEntries.length ? sortedEntries.map(entry => `<div class="file-entry" data-path="${esc(entry.path)}" data-dir="${entry.dir ? 1 : 0}" data-name="${esc(entry.name)}" data-uid="${entry.uid == null ? '' : esc(entry.uid)}" data-gid="${entry.gid == null ? '' : esc(entry.gid)}" tabindex="0">
       <div class="file-name-cell"><span class="file-type-icon">${actionIcon(entry.dir ? 'folder' : (isImageFile(entry.name) ? 'image' : 'file'))}</span><div><b>${esc(entry.name)}</b><small>${entry.dir ? 'Ordner' : (isImageFile(entry.name) ? 'Bild' : 'Datei')}</small></div></div>
-      <span class="file-date"><span>${esc(fmtDateTime(entry.modTime))}</span><small>${esc(L('Letzte Bearbeitung','Last modified'))}</small></span>
+      <span class="file-date">${esc(fmtDateTime(entry.modTime))}</span>
       <span class="file-size">${entry.dir ? '—' : fmtSize(entry.size)}</span>
       <span class="file-mode">${esc(entry.mode)}</span>
       <button class="file-mobile-actions" type="button" aria-label="${esc(L('Dateiaktionen','File actions'))}">⋮</button>
@@ -3060,12 +3126,16 @@ function uploadRemoteFile(serverId, remotePath, file, panel = null, options = {}
       if (root && !options.externalProgress) root.hidden = true;
       if (xhr.status >= 200 && xhr.status < 300) { resolve(); return; }
       const raw = String(xhr.responseText || '');
-      let backendMessage = '';
-      try { backendMessage = String(JSON.parse(raw)?.error || '').trim(); } catch { /* non-JSON response */ }
+      let payload = {};
+      if (raw && !looksLikeHTMLResponse(raw, xhr.getResponseHeader('Content-Type') || '')) {
+        try { payload = JSON.parse(raw) || {}; } catch { /* non-JSON response */ }
+      }
+      const backendMessage = typeof payload.error === 'string' ? payload.error.trim() : '';
+      const permissionMessage = filePermissionFailureMessage(payload.code);
       let message;
-      if (xhr.status >= 500) message = httpFailureMessage(xhr.status);
+      if (permissionMessage) message = permissionMessage;
+      else if (xhr.status >= 500) message = httpFailureMessage(xhr.status);
       else if (backendMessage && !looksLikeHTMLResponse(backendMessage)) message = backendMessage;
-      else if (raw && !looksLikeHTMLResponse(raw, xhr.getResponseHeader('Content-Type') || '')) message = raw.slice(0, 300);
       else message = httpFailureMessage(xhr.status);
       reject(new Error(message));
     };
@@ -3913,7 +3983,7 @@ async function loadDualPane(pane, serverId, path = '.') {
   body.dataset.loaded = '1';
   const rows = [...(currentPath === '/' ? [] : [{ name: '..', path: parent(currentPath), dir: true, parent: true, uid: null, gid: null, modTime: null }]), ...sortRemoteEntries(data.entries || [])];
   const parentColor = configuredServerColor(serverId);
-  body.innerHTML = rows.map(entry => `<div class="pane-row ${entry.parent ? 'parent-pane-row' : ''}" data-path="${esc(entry.path)}" data-name="${esc(entry.name)}" data-dir="${entry.dir ? 1 : 0}" data-parent="${entry.parent ? 1 : 0}" data-uid="${entry.uid == null ? '' : esc(entry.uid)}" data-gid="${entry.gid == null ? '' : esc(entry.gid)}" draggable="${!entry.parent ? 'true' : 'false'}"><span class="pane-type-icon"${entry.parent ? ` style="color:${esc(parentColor)}"` : ''}>${entry.parent ? '↰' : actionIcon(entry.dir ? 'folder' : (isImageFile(entry.name) ? 'image' : 'file'))}</span><b>${esc(entry.name)}</b>${entry.parent ? '<span></span><span></span>' : `<span class="pane-date"><span>${esc(fmtDateTime(entry.modTime))}</span><small>${esc(L('Letzte Bearbeitung','Last modified'))}</small></span><small class="pane-size">${entry.dir ? '—' : fmtSize(entry.size)}</small>`}${entry.parent ? '' : `<button class="pane-mobile-actions" type="button" aria-label="${esc(L('Dateiaktionen','File actions'))}">⋮</button>`}</div>`).join('');
+  body.innerHTML = rows.map(entry => `<div class="pane-row ${entry.parent ? 'parent-pane-row' : ''}" data-path="${esc(entry.path)}" data-name="${esc(entry.name)}" data-dir="${entry.dir ? 1 : 0}" data-parent="${entry.parent ? 1 : 0}" data-uid="${entry.uid == null ? '' : esc(entry.uid)}" data-gid="${entry.gid == null ? '' : esc(entry.gid)}" draggable="${!entry.parent ? 'true' : 'false'}"><span class="pane-type-icon"${entry.parent ? ` style="color:${esc(parentColor)}"` : ''}>${entry.parent ? '↰' : actionIcon(entry.dir ? 'folder' : (isImageFile(entry.name) ? 'image' : 'file'))}</span><b>${esc(entry.name)}</b>${entry.parent ? '<span></span><span></span>' : `<span class="pane-date">${esc(fmtDateTime(entry.modTime))}</span><small class="pane-size">${entry.dir ? '—' : fmtSize(entry.size)}</small>`}${entry.parent ? '' : `<button class="pane-mobile-actions" type="button" aria-label="${esc(L('Dateiaktionen','File actions'))}">⋮</button>`}</div>`).join('');
   $$('.pane-row', body).forEach(row => {
     const isDir = row.dataset.dir === '1';
     const isParent = row.dataset.parent === '1';

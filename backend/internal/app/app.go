@@ -153,6 +153,24 @@ func (a *App) internalError(w http.ResponseWriter, operation string, err error) 
 	log.Printf("internal request error id=%s operation=%s: %v", requestID, operation, err)
 	jsonOut(w, http.StatusInternalServerError, map[string]string{"error": "internal server error", "requestId": requestID})
 }
+func isPermissionDeniedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrPermission) {
+		return true
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(message, "permission denied") || strings.Contains(message, "operation not permitted")
+}
+
+func (a *App) fileOperationError(w http.ResponseWriter, code string, err error) {
+	if isPermissionDeniedError(err) {
+		jsonOut(w, http.StatusForbidden, map[string]string{"error": "permission denied", "code": code})
+		return
+	}
+	a.internalError(w, "app", err)
+}
 func decode(r *http.Request, v any) error {
 	return json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(v)
 }
@@ -1619,13 +1637,13 @@ func (a *App) files(w http.ResponseWriter, r *http.Request) {
 			}
 			f, openErr := sf.Open(p)
 			if openErr != nil {
-				a.internalError(w, "app", openErr)
+				a.fileOperationError(w, "file_read_forbidden", openErr)
 				return
 			}
 			defer f.Close()
 			b, readErr := io.ReadAll(io.LimitReader(f, maxEditorBytes+1))
 			if readErr != nil {
-				a.internalError(w, "app", readErr)
+				a.fileOperationError(w, "file_read_forbidden", readErr)
 				return
 			}
 			if int64(len(b)) > maxEditorBytes {
@@ -1637,7 +1655,7 @@ func (a *App) files(w http.ResponseWriter, r *http.Request) {
 		}
 		xs, e := sshx.List(sf, p)
 		if e != nil {
-			a.internalError(w, "app", e)
+			a.fileOperationError(w, "file_read_forbidden", e)
 			return
 		}
 		settings, settingsErr := a.settingsForUser(uid(r))
@@ -1659,7 +1677,7 @@ func (a *App) files(w http.ResponseWriter, r *http.Request) {
 			defer func() { _ = controller.SetReadDeadline(time.Time{}) }()
 		}
 		if e = sshx.Upload(sf, p, uploadBody); e != nil {
-			a.internalError(w, "app", e)
+			a.fileOperationError(w, "file_write_forbidden", e)
 			return
 		}
 		jsonOut(w, 200, map[string]bool{"ok": true})
@@ -1724,7 +1742,7 @@ func (a *App) files(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if e != nil {
-			a.internalError(w, "app", e)
+			a.fileOperationError(w, "file_operation_forbidden", e)
 			return
 		}
 		jsonOut(w, 200, map[string]bool{"ok": true})
@@ -1734,7 +1752,7 @@ func (a *App) files(w http.ResponseWriter, r *http.Request) {
 			e = sf.RemoveDirectory(p)
 		}
 		if e != nil {
-			a.internalError(w, "app", e)
+			a.fileOperationError(w, "file_delete_forbidden", e)
 			return
 		}
 		jsonOut(w, 200, map[string]bool{"ok": true})
