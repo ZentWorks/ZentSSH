@@ -33,6 +33,7 @@ const state = {
   suppressServerClickUntil: 0,
   draggingTabId: null,
   suppressTabClickUntil: 0,
+  localUploadBatches: new Set(),
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -2325,6 +2326,13 @@ function normalizeRemotePath(path) {
   return `${absolute ? '/' : ''}${parts.join('/')}` || (absolute ? '/' : '.');
 }
 
+async function resolveFileDirectoryPath(serverId, remotePath = '.') {
+  const raw = String(remotePath || '.').trim() || '.';
+  if (raw.startsWith('/')) return normalizeRemotePath(raw);
+  const resolved = await api(`/files/${serverId}?path=${encodeURIComponent(raw)}&realpath=1`);
+  return normalizeRemotePath(resolved.path || raw);
+}
+
 async function ensureTerminalHome(tab, server) {
   if (tab.homeDir) return tab.homeDir;
   const result = await api(`/files/${server.id}?path=.&realpath=1`);
@@ -2703,7 +2711,7 @@ function createFilePanel(tab, server) {
       <div class="filepathinput"><input data-file-path value="${esc(tab.filePath || '.')}" autocomplete="off"><button data-file-action="open" class="button-with-icon">${iconLabel('open', 'Öffnen')}</button></div>
     </div>
     <div data-upload-progress class="upload-progress" hidden><i></i><span>Upload…</span></div>
-    <div class="filelist-head"><span>Name</span><span>Größe</span><span>Rechte</span></div>
+    <div class="filelist-head"><span>Name</span><span>Datum</span><span>Größe</span><span>Rechte</span></div>
     <div data-file-body class="filebody clean-filebody"><div class="fileloading">Lade Verzeichnis…</div></div>`;
 
   const pathInput = $('[data-file-path]', panel);
@@ -2819,6 +2827,7 @@ async function refreshFileDirectory(tab, path = '.', options = {}) {
 
   let data;
   try {
+    path = await resolveFileDirectoryPath(serverId, path);
     data = await api(`/files/${serverId}?path=${encodeURIComponent(path)}`);
   } catch (e) {
     if (requestId !== tab.fileRefreshSeq) return;
@@ -2847,11 +2856,12 @@ async function refreshFileDirectory(tab, path = '.', options = {}) {
   updateFileHiddenButton(tab);
 
   const parentColor = configuredServerColor(serverId);
-  const parentRow = path === '.' || path === '/' ? '' : `<div class="file-entry parent-entry" data-path="${esc(parent(path))}" data-dir="1" data-name=".." tabindex="0"><div class="file-name-cell"><span class="file-type-icon parent-icon" style="color:${esc(parentColor)}">↰</span><div><b>..</b><small>Eine Ebene hoch</small></div></div><span></span><span></span></div>`;
+  const parentRow = path === '/' ? '' : `<div class="file-entry parent-entry" data-path="${esc(parent(path))}" data-dir="1" data-name=".." tabindex="0"><div class="file-name-cell"><span class="file-type-icon parent-icon" style="color:${esc(parentColor)}">↰</span><div><b>..</b><small>Eine Ebene hoch</small></div></div><span></span><span></span><span></span></div>`;
   const sortedEntries = sortRemoteEntries(data.entries || []);
   if (body) {
     body.innerHTML = parentRow + (sortedEntries.length ? sortedEntries.map(entry => `<div class="file-entry" data-path="${esc(entry.path)}" data-dir="${entry.dir ? 1 : 0}" data-name="${esc(entry.name)}" data-uid="${entry.uid == null ? '' : esc(entry.uid)}" data-gid="${entry.gid == null ? '' : esc(entry.gid)}" tabindex="0">
       <div class="file-name-cell"><span class="file-type-icon">${actionIcon(entry.dir ? 'folder' : (isImageFile(entry.name) ? 'image' : 'file'))}</span><div><b>${esc(entry.name)}</b><small>${entry.dir ? 'Ordner' : (isImageFile(entry.name) ? 'Bild' : 'Datei')}</small></div></div>
+      <span class="file-date"><span>${esc(fmtDateTime(entry.modTime))}</span><small>${esc(L('Letzte Bearbeitung','Last modified'))}</small></span>
       <span class="file-size">${entry.dir ? '—' : fmtSize(entry.size)}</span>
       <span class="file-mode">${esc(entry.mode)}</span>
       <button class="file-mobile-actions" type="button" aria-label="${esc(L('Dateiaktionen','File actions'))}">⋮</button>
@@ -3064,7 +3074,32 @@ function uploadRemoteFile(serverId, remotePath, file, panel = null, options = {}
 }
 
 const LOCAL_DROP_UPLOAD_CONCURRENCY = 2;
+const LOCAL_DROP_BACKGROUND_CONCURRENCY = 6;
 const LOCAL_DROP_MAX_FILES = 5000;
+
+function localUploadDesiredConcurrency() {
+  return document.hidden ? LOCAL_DROP_BACKGROUND_CONCURRENCY : LOCAL_DROP_UPLOAD_CONCURRENCY;
+}
+
+function hasActiveLocalUploads() {
+  return state.localUploadBatches.size > 0;
+}
+
+window.addEventListener('beforeunload', event => {
+  if (!hasActiveLocalUploads()) return;
+  event.preventDefault();
+  event.returnValue = '';
+});
+
+function boostLocalUploadsForBackground() {
+  // Browsers may freeze background tabs. Start a few additional network requests
+  // while the page is still executing so ongoing uploads can continue in the
+  // browser network stack even if JavaScript callbacks are throttled afterwards.
+  state.localUploadBatches.forEach(batch => pumpLocalUploadBatch(batch, LOCAL_DROP_BACKGROUND_CONCURRENCY));
+}
+
+document.addEventListener('visibilitychange', () => { if (document.hidden) boostLocalUploadsForBackground(); });
+document.addEventListener('freeze', boostLocalUploadsForBackground);
 
 function dataTransferHasType(dataTransfer, type) {
   return [...(dataTransfer?.types || [])].includes(type);
@@ -3199,55 +3234,45 @@ function clearLocalDropOverlay(target) { setLocalDropOverlay(target); }
 async function uploadLocalDrop({ dataTransfer, target, serverId, currentPath, onRefresh }) {
   setLocalDropOverlay(target, 'upload', L('Upload wird vorbereitet…','Preparing upload…'), currentPath || '.');
   let dropped;
+  let batch = null;
   try {
     dropped = await collectLocalDrop(dataTransfer);
     if (!dropped.files.length && !dropped.directories.length) throw new Error(L('Keine Dateien zum Hochladen gefunden.','No files found to upload.'));
 
+    // Create parents first. This is deliberately finished before file uploads
+    // start so a background-tab freeze can never leave files racing their folders.
     for (const relativeDir of dropped.directories) {
       await api(`/files/${serverId}`, { method: 'POST', body: JSON.stringify({ action: 'mkdir', path: joinRemotePath(currentPath, relativeDir) }) });
     }
 
     const totalBytes = dropped.files.reduce((sum, item) => sum + Number(item.file?.size || 0), 0);
-    const loadedByIndex = new Map();
-    const failures = [];
-    let completed = 0;
-    let nextIndex = 0;
-    const renderProgress = (activeName = '') => {
-      const loaded = [...loadedByIndex.values()].reduce((sum, value) => sum + value, 0);
-      const pct = totalBytes > 0 ? Math.min(100, Math.round(loaded / totalBytes * 100)) : (dropped.files.length ? Math.round(completed / dropped.files.length * 100) : 100);
-      setLocalDropOverlay(target, 'upload', `${L('Upload','Upload')} ${completed}/${dropped.files.length} · ${pct}%`, activeName || currentPath || '.');
+    batch = {
+      serverId,
+      currentPath,
+      target,
+      files: dropped.files,
+      totalBytes,
+      loadedByIndex: new Map(),
+      failures: [],
+      completed: 0,
+      nextIndex: 0,
+      activeWorkers: 0,
+      settled: false,
+      resolve: null,
+      reject: null,
+      done: null,
     };
-    renderProgress();
-
-    const worker = async () => {
-      while (true) {
-        const index = nextIndex++;
-        if (index >= dropped.files.length) return;
-        const item = dropped.files[index];
-        const remotePath = joinRemotePath(currentPath, item.relativePath);
-        loadedByIndex.set(index, 0);
-        try {
-          await uploadRemoteFile(serverId, remotePath, item.file, null, {
-            externalProgress: true,
-            onProgress: ({ loaded }) => { loadedByIndex.set(index, loaded); renderProgress(item.relativePath); },
-          });
-          loadedByIndex.set(index, Number(item.file?.size || 0));
-        } catch (error) {
-          failures.push({ path: item.relativePath, error });
-        } finally {
-          completed += 1;
-          renderProgress(item.relativePath);
-        }
-      }
-    };
-
-    await Promise.all(Array.from({ length: Math.min(LOCAL_DROP_UPLOAD_CONCURRENCY, Math.max(1, dropped.files.length)) }, () => worker()));
+    batch.done = new Promise((resolve, reject) => { batch.resolve = resolve; batch.reject = reject; });
+    state.localUploadBatches.add(batch);
+    renderLocalUploadBatchProgress(batch);
+    pumpLocalUploadBatch(batch, localUploadDesiredConcurrency());
+    await batch.done;
     await onRefresh?.();
 
-    const succeeded = dropped.files.length - failures.length;
-    if (failures.length) {
-      const sample = failures.slice(0, 3).map(item => item.path).join(', ');
-      showToast(`${succeeded} ${L('Dateien hochgeladen','files uploaded')}, ${failures.length} ${L('fehlgeschlagen','failed')}${sample ? `: ${sample}` : ''}`, true);
+    const succeeded = dropped.files.length - batch.failures.length;
+    if (batch.failures.length) {
+      const sample = batch.failures.slice(0, 3).map(item => item.path).join(', ');
+      showToast(`${succeeded} ${L('Dateien hochgeladen','files uploaded')}, ${batch.failures.length} ${L('fehlgeschlagen','failed')}${sample ? `: ${sample}` : ''}`, true);
     } else if (!dropped.files.length && dropped.directories.length) {
       showToast(dropped.directories.length === 1 ? L('Ordner angelegt.','Folder created.') : `${dropped.directories.length} ${L('Ordner angelegt.','folders created.')}`);
     } else {
@@ -3256,7 +3281,68 @@ async function uploadLocalDrop({ dataTransfer, target, serverId, currentPath, on
   } catch (error) {
     showToast(error.message || L('Upload fehlgeschlagen.','Upload failed.'), true);
   } finally {
+    if (batch) state.localUploadBatches.delete(batch);
     clearLocalDropOverlay(target);
+  }
+}
+
+function renderLocalUploadBatchProgress(batch, activeName = '') {
+  if (!batch) return;
+  const loaded = [...batch.loadedByIndex.values()].reduce((sum, value) => sum + value, 0);
+  const pct = batch.totalBytes > 0
+    ? Math.min(100, Math.round(loaded / batch.totalBytes * 100))
+    : (batch.files.length ? Math.round(batch.completed / batch.files.length * 100) : 100);
+  setLocalDropOverlay(
+    batch.target,
+    'upload',
+    `${L('Upload','Upload')} ${batch.completed}/${batch.files.length} · ${pct}%`,
+    activeName || batch.currentPath || '.',
+  );
+}
+
+function finishLocalUploadBatch(batch) {
+  if (!batch || batch.settled || batch.completed < batch.files.length) return;
+  batch.settled = true;
+  batch.resolve();
+}
+
+function pumpLocalUploadBatch(batch, concurrency = localUploadDesiredConcurrency()) {
+  if (!batch || batch.settled) return;
+  const desired = Math.max(1, Number(concurrency) || LOCAL_DROP_UPLOAD_CONCURRENCY);
+  while (batch.activeWorkers < desired && batch.nextIndex < batch.files.length) {
+    batch.activeWorkers += 1;
+    runLocalUploadWorker(batch).finally(() => {
+      batch.activeWorkers = Math.max(0, batch.activeWorkers - 1);
+      finishLocalUploadBatch(batch);
+      if (!batch.settled && batch.nextIndex < batch.files.length) pumpLocalUploadBatch(batch, localUploadDesiredConcurrency());
+    });
+  }
+  finishLocalUploadBatch(batch);
+}
+
+async function runLocalUploadWorker(batch) {
+  while (!batch.settled) {
+    const index = batch.nextIndex++;
+    if (index >= batch.files.length) return;
+    const item = batch.files[index];
+    const remotePath = joinRemotePath(batch.currentPath, item.relativePath);
+    batch.loadedByIndex.set(index, 0);
+    try {
+      await uploadRemoteFile(batch.serverId, remotePath, item.file, null, {
+        externalProgress: true,
+        onProgress: ({ loaded }) => {
+          batch.loadedByIndex.set(index, loaded);
+          renderLocalUploadBatchProgress(batch, item.relativePath);
+        },
+      });
+      batch.loadedByIndex.set(index, Number(item.file?.size || 0));
+    } catch (error) {
+      batch.failures.push({ path: item.relativePath, error });
+    } finally {
+      batch.completed += 1;
+      renderLocalUploadBatchProgress(batch, item.relativePath);
+      finishLocalUploadBatch(batch);
+    }
   }
 }
 
@@ -3716,7 +3802,7 @@ async function openDualFiles(leftServerId, rightServerId = null, leftPath = '.',
     }
     return options.map(s => `<option value="${s.id}" ${Number(s.id) === Number(selected) ? 'selected' : ''}>${esc(s.name)} · ${esc(s.host)}</option>`).join('');
   };
-  const paneMarkup = (side, serverId, panePath) => `<section class="filepane" data-side="${side}"><div class="panehead"><select class="pane-server">${serverOptions(serverId)}</select><div><input class="pane-path" value="${esc(panePath)}"><button class="pane-open button-with-icon">${iconLabel('open', 'Öffnen')}</button></div><input class="pane-upload" type="file" hidden></div><div class="pane-body">Lade…</div></section>`;
+  const paneMarkup = (side, serverId, panePath) => `<section class="filepane" data-side="${side}"><div class="panehead"><select class="pane-server">${serverOptions(serverId)}</select><div><input class="pane-path" value="${esc(panePath)}"><button class="pane-open button-with-icon">${iconLabel('open', 'Öffnen')}</button></div><input class="pane-upload" type="file" hidden></div><div class="pane-columns"><span></span><span>${L('Name','Name')}</span><span>${L('Datum','Date')}</span><span>${L('Größe','Size')}</span></div><div class="pane-body">Lade…</div></section>`;
   workspace.innerHTML = `<div class="dual-files" data-dual-files data-mobile-pane="left">
     <div class="dual-toolbar"><b class="dual-title"><span class="dual-title-icon">${actionIcon('dual')}</span><span>Dual File Manager</span></b><div class="dual-mobile-switch" role="tablist" aria-label="${esc(L('Dateiansicht','File view'))}"><button type="button" class="active" data-dual-show="left" role="tab" aria-selected="true">${L('Quelle','Source')}</button><button type="button" data-dual-show="right" role="tab" aria-selected="false">${L('Ziel','Target')}</button></div><button id="dual-close" class="button-with-icon">${iconLabel('files', 'Einzelansicht')}</button></div>
     <div class="dual-grid">
@@ -3814,6 +3900,7 @@ async function loadDualPane(pane, serverId, path = '.') {
   let data;
   try {
     await ensureServerReady(serverId);
+    path = await resolveFileDirectoryPath(serverId, path);
     data = await api(`/files/${serverId}?path=${encodeURIComponent(path)}`);
   } catch (e) {
     pane.classList.remove('pane-refreshing');
@@ -3824,9 +3911,9 @@ async function loadDualPane(pane, serverId, path = '.') {
   const currentPath = data.path || path;
   $('.pane-path', pane).value = currentPath;
   body.dataset.loaded = '1';
-  const rows = [{ name: '..', path: parent(currentPath), dir: true, parent: true, uid: null, gid: null }, ...sortRemoteEntries(data.entries || [])];
+  const rows = [...(currentPath === '/' ? [] : [{ name: '..', path: parent(currentPath), dir: true, parent: true, uid: null, gid: null, modTime: null }]), ...sortRemoteEntries(data.entries || [])];
   const parentColor = configuredServerColor(serverId);
-  body.innerHTML = rows.map(entry => `<div class="pane-row ${entry.parent ? 'parent-pane-row' : ''}" data-path="${esc(entry.path)}" data-name="${esc(entry.name)}" data-dir="${entry.dir ? 1 : 0}" data-parent="${entry.parent ? 1 : 0}" data-uid="${entry.uid == null ? '' : esc(entry.uid)}" data-gid="${entry.gid == null ? '' : esc(entry.gid)}" draggable="${!entry.parent ? 'true' : 'false'}"><span class="pane-type-icon"${entry.parent ? ` style="color:${esc(parentColor)}"` : ''}>${entry.parent ? '↰' : actionIcon(entry.dir ? 'folder' : (isImageFile(entry.name) ? 'image' : 'file'))}</span><b>${esc(entry.name)}</b><small>${entry.dir ? '' : fmtSize(entry.size)}</small>${entry.parent ? '' : `<button class="pane-mobile-actions" type="button" aria-label="${esc(L('Dateiaktionen','File actions'))}">⋮</button>`}</div>`).join('');
+  body.innerHTML = rows.map(entry => `<div class="pane-row ${entry.parent ? 'parent-pane-row' : ''}" data-path="${esc(entry.path)}" data-name="${esc(entry.name)}" data-dir="${entry.dir ? 1 : 0}" data-parent="${entry.parent ? 1 : 0}" data-uid="${entry.uid == null ? '' : esc(entry.uid)}" data-gid="${entry.gid == null ? '' : esc(entry.gid)}" draggable="${!entry.parent ? 'true' : 'false'}"><span class="pane-type-icon"${entry.parent ? ` style="color:${esc(parentColor)}"` : ''}>${entry.parent ? '↰' : actionIcon(entry.dir ? 'folder' : (isImageFile(entry.name) ? 'image' : 'file'))}</span><b>${esc(entry.name)}</b>${entry.parent ? '<span></span><span></span>' : `<span class="pane-date"><span>${esc(fmtDateTime(entry.modTime))}</span><small>${esc(L('Letzte Bearbeitung','Last modified'))}</small></span><small class="pane-size">${entry.dir ? '—' : fmtSize(entry.size)}</small>`}${entry.parent ? '' : `<button class="pane-mobile-actions" type="button" aria-label="${esc(L('Dateiaktionen','File actions'))}">⋮</button>`}</div>`).join('');
   $$('.pane-row', body).forEach(row => {
     const isDir = row.dataset.dir === '1';
     const isParent = row.dataset.parent === '1';
