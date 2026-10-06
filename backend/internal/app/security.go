@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -315,8 +316,33 @@ func (a *App) secureCookie(r *http.Request) bool {
 	}
 }
 
+func (a *App) setSessionCookie(w http.ResponseWriter, r *http.Request, token string, exp time.Time) {
+	http.SetCookie(w, &http.Cookie{Name: "zentssh_session", Value: token, Path: "/", HttpOnly: true, Secure: a.secureCookie(r), SameSite: http.SameSiteLaxMode, Expires: exp})
+}
+
 func (a *App) setCSRFCookie(w http.ResponseWriter, r *http.Request, token string, exp time.Time) {
 	http.SetCookie(w, &http.Cookie{Name: "zentssh_csrf", Value: token, Path: "/", HttpOnly: false, Secure: a.secureCookie(r), SameSite: http.SameSiteStrictMode, Expires: exp})
+}
+
+func (a *App) renewWebSessionIfNeeded(w http.ResponseWriter, r *http.Request, rawToken, lookupID string, currentExpiry time.Time) time.Time {
+	ttl := a.cfg.SessionTTL
+	if ttl <= 0 || rawToken == "" {
+		return currentExpiry
+	}
+	now := time.Now()
+	if currentExpiry.Sub(now) > ttl/2 {
+		return currentExpiry
+	}
+	newExpiry := now.Add(ttl)
+	if _, err := a.DB.Exec("UPDATE sessions SET expires_at=? WHERE id IN (?,?)", newExpiry, lookupID, rawToken); err != nil {
+		log.Printf("web session renewal failed: %v", err)
+		return currentExpiry
+	}
+	a.setSessionCookie(w, r, rawToken, newExpiry)
+	if c, err := r.Cookie("zentssh_csrf"); err == nil && strings.TrimSpace(c.Value) != "" {
+		a.setCSRFCookie(w, r, c.Value, newExpiry)
+	}
+	return newExpiry
 }
 
 func (a *App) clearAuthCookies(w http.ResponseWriter, r *http.Request) {

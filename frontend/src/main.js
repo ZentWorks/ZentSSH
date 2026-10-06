@@ -34,7 +34,57 @@ const state = {
   draggingTabId: null,
   suppressTabClickUntil: 0,
   localUploadBatches: new Set(),
+  authExpired: false,
 };
+
+
+const WEB_SESSION_KEEPALIVE_MS = 2 * 60 * 1000;
+let webSessionKeepaliveTimer = null;
+let webSessionKeepaliveInFlight = false;
+
+function hasOpenTerminalTabs() {
+  return state.tabs.some(tab => (tab.type || 'terminal') === 'terminal' && !tab.closing);
+}
+
+function suspendTerminalSocketsForAuthExpiry() {
+  for (const tab of state.tabs) {
+    if ((tab.type || 'terminal') !== 'terminal') continue;
+    clearTimeout(tab.reconnectTimer);
+    tab.reconnectTimer = null;
+    if (tab.ws) {
+      try { tab.ws.close(1000, 'auth_expired'); } catch { /* socket may already be closed */ }
+      tab.ws = null;
+    }
+  }
+}
+
+function handleExpiredWebSession() {
+  if (!state.me || state.authExpired) return;
+  state.authExpired = true;
+  suspendTerminalSocketsForAuthExpiry();
+  if (transferMonitorTimer) { clearTimeout(transferMonitorTimer); transferMonitorTimer = null; }
+  state.me = null;
+  state.notice = L('Deine Sitzung ist abgelaufen. Bitte erneut anmelden.','Your session has expired. Please sign in again.');
+  document.title = 'ZentSSH';
+  renderLogin();
+}
+
+async function webSessionKeepalive() {
+  if (!state.me || state.authExpired || !hasOpenTerminalTabs() || webSessionKeepaliveInFlight) return;
+  webSessionKeepaliveInFlight = true;
+  try {
+    await api('/session/keepalive', { method: 'POST' });
+  } catch (error) {
+    if (error?.status !== 401 && !error?.network) console.warn('ZentSSH session keepalive failed', error);
+  } finally {
+    webSessionKeepaliveInFlight = false;
+  }
+}
+
+function startWebSessionKeepalive() {
+  if (webSessionKeepaliveTimer) clearInterval(webSessionKeepaliveTimer);
+  webSessionKeepaliveTimer = setInterval(webSessionKeepalive, WEB_SESSION_KEEPALIVE_MS);
+}
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -202,7 +252,7 @@ window.addEventListener('resize', updateVisualViewport, { passive: true });
 window.visualViewport?.addEventListener('resize', updateVisualViewport, { passive: true });
 window.visualViewport?.addEventListener('scroll', updateVisualViewport, { passive: true });
 window.addEventListener('focus', () => refitActiveTerminal(0), { passive: true });
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refitActiveTerminal(0); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { refitActiveTerminal(0); webSessionKeepalive(); } });
 window.matchMedia?.('(max-width: 760px)').addEventListener?.('change', event => {
   if (!event.matches) closeMobileNav();
   updateVisualViewport();
@@ -502,10 +552,14 @@ async function responseError(response) {
   } else {
     message = httpFailureMessage(response.status);
   }
+  const authExpired = Number(response.status) === 401 && data.code === 'session_invalid' && Boolean(state.me || state.authExpired);
+  if (authExpired) message = L('Deine Sitzung ist abgelaufen. Bitte erneut anmelden.','Your session has expired. Please sign in again.');
   const error = new Error(message);
   error.status = response.status;
   error.data = data;
   error.responseWasHTML = payload.html;
+  error.authExpired = authExpired;
+  if (authExpired) handleExpiredWebSession();
   return error;
 }
 
@@ -576,13 +630,20 @@ async function boot() {
   if (setupState.needed) return renderSetup();
   try {
     state.me = await api('/me');
+    state.authExpired = false;
     applyDocumentLanguage();
   } catch {
     return renderLogin();
   }
-  await loadWorkspace();
+  try {
+    await loadWorkspace();
+  } catch (error) {
+    if (error?.authExpired || state.authExpired) return;
+    throw error;
+  }
   applyDocumentLanguage();
   renderApp();
+  startWebSessionKeepalive();
   bootstrapTransferMonitor();
 }
 
@@ -2567,7 +2628,7 @@ function startTerminal(tid, server) {
 }
 
 function connectTerminal(tab, server) {
-  if (!tab || tab.closing || !state.tabs.includes(tab)) return;
+  if (!tab || tab.closing || state.authExpired || !state.me || !state.tabs.includes(tab)) return;
   if (tab.ws && (tab.ws.readyState === WebSocket.OPEN || tab.ws.readyState === WebSocket.CONNECTING)) return;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws/ssh/${encodeURIComponent(tab.sessionId)}`);
@@ -2592,7 +2653,7 @@ function connectTerminal(tab, server) {
     }
   };
   ws.onclose = event => {
-    if (tab.closing || !state.tabs.includes(tab)) return;
+    if (tab.closing || state.authExpired || !state.me || !state.tabs.includes(tab)) return;
     if (event.code === 1000 && event.reason) {
       untrackSession(tab.sessionId);
       const sessionName = tab.name || server?.name || tab.sessionId;
@@ -3133,11 +3194,17 @@ function uploadRemoteFile(serverId, remotePath, file, panel = null, options = {}
       const backendMessage = typeof payload.error === 'string' ? payload.error.trim() : '';
       const permissionMessage = filePermissionFailureMessage(payload.code);
       let message;
-      if (permissionMessage) message = permissionMessage;
+      if (xhr.status === 401 && payload.code === 'session_invalid' && (state.me || state.authExpired)) {
+        message = L('Deine Sitzung ist abgelaufen. Bitte erneut anmelden.','Your session has expired. Please sign in again.');
+        handleExpiredWebSession();
+      } else if (permissionMessage) message = permissionMessage;
       else if (xhr.status >= 500) message = httpFailureMessage(xhr.status);
       else if (backendMessage && !looksLikeHTMLResponse(backendMessage)) message = backendMessage;
       else message = httpFailureMessage(xhr.status);
-      reject(new Error(message));
+      const error = new Error(message);
+      error.status = xhr.status;
+      error.authExpired = xhr.status === 401 && payload.code === 'session_invalid' && state.authExpired;
+      reject(error);
     };
     xhr.send(file);
   });
@@ -5464,4 +5531,4 @@ document.addEventListener('keydown', event => {
   if (event.key === 'Escape' && $('.shell')?.classList.contains('mobile-nav-open')) closeMobileNav();
 });
 
-boot().catch(e => { app.innerHTML = `<pre>${esc(e.stack || e.message)}</pre>`; });
+boot().catch(e => { if (e?.authExpired || state.authExpired) return; app.innerHTML = `<pre>${esc(e.stack || e.message)}</pre>`; });

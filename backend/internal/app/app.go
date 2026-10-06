@@ -284,6 +284,7 @@ func (a *App) Routes() http.Handler {
 	m.Handle("/api/me/oidc", a.auth(http.HandlerFunc(a.meOIDC)))
 	m.Handle("/api/me/oidc/start", a.auth(http.HandlerFunc(a.oidcLinkStart)))
 	m.Handle("/api/logout", a.auth(http.HandlerFunc(a.logout)))
+	m.Handle("/api/session/keepalive", a.auth(http.HandlerFunc(a.sessionKeepalive)))
 	m.Handle("/api/me", a.auth(http.HandlerFunc(a.me)))
 	m.Handle("/api/me/settings", a.auth(http.HandlerFunc(a.meSettings)))
 	m.Handle("/api/workspaces", a.auth(http.HandlerFunc(a.workspaces)))
@@ -630,7 +631,7 @@ func (a *App) createSession(w http.ResponseWriter, r *http.Request, userID int64
 	if e = tx.Commit(); e != nil {
 		return nil, e
 	}
-	http.SetCookie(w, &http.Cookie{Name: "zentssh_session", Value: sid, Path: "/", HttpOnly: true, Secure: a.secureCookie(r), SameSite: http.SameSiteLaxMode, Expires: exp})
+	a.setSessionCookie(w, r, sid, exp)
 	a.setCSRFCookie(w, r, csrf, exp)
 	return map[string]any{"id": userID, "name": name, "email": email, "role": userRole}, nil
 }
@@ -645,11 +646,19 @@ func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 	a.clearAuthCookies(w, r)
 	jsonOut(w, 200, map[string]bool{"ok": true})
 }
+
+func (a *App) sessionKeepalive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	jsonOut(w, http.StatusOK, map[string]bool{"ok": true})
+}
 func (a *App) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, e := r.Cookie("zentssh_session")
 		if e != nil || c.Value == "" {
-			jsonOut(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			jsonOut(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized", "code": "session_invalid"})
 			return
 		}
 		var userID int64
@@ -663,20 +672,23 @@ func (a *App) auth(next http.Handler) http.Handler {
 		if e != nil || time.Now().After(exp) {
 			_, _ = a.DB.Exec("DELETE FROM sessions WHERE id IN (?,?)", lookupID, c.Value)
 			a.clearAuthCookies(w, r)
-			jsonOut(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			jsonOut(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized", "code": "session_invalid"})
 			return
 		}
 		userRole, e := a.roleForUser(userID)
 		if e != nil {
-			jsonOut(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			_, _ = a.DB.Exec("DELETE FROM sessions WHERE id IN (?,?)", lookupID, c.Value)
+			a.clearAuthCookies(w, r)
+			jsonOut(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized", "code": "session_invalid"})
 			return
 		}
 		if !a.csrfOK(r) {
 			jsonOut(w, http.StatusForbidden, map[string]string{"error": "CSRF validation failed"})
 			return
 		}
+		exp = a.renewWebSessionIfNeeded(w, r, c.Value, lookupID, exp)
 		if !isUnsafeMethod(r.Method) {
-			if c, ce := r.Cookie("zentssh_csrf"); ce != nil || c.Value == "" {
+			if csrfCookie, ce := r.Cookie("zentssh_csrf"); ce != nil || csrfCookie.Value == "" {
 				a.setCSRFCookie(w, r, randID(32), exp)
 			}
 		}

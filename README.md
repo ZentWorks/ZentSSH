@@ -96,7 +96,7 @@ Most installations only need the variables below. With Docker Compose, copy `.en
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `WEB_SESSION_TTL` | `24h` | Lifetime of a WebUI login session |
+| `WEB_SESSION_TTL` | `24h` | Sliding inactivity window for WebUI login sessions; active use and open SSH tabs renew it |
 | `MAX_WEB_SESSIONS_PER_USER` | `20` | Maximum WebUI sessions per user |
 | `LOGIN_RATE_LIMIT_MAX` | `10` | Login attempts allowed per rate-limit window |
 | `LOGIN_RATE_LIMIT_WINDOW` | `10m` | Login rate-limit window |
