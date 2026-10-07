@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,7 @@ type LiveSession struct {
 	Port       int
 	Transient  bool
 	CreatedAt  time.Time
+	Order      int
 
 	SSHSession *ssh.Session
 	In         io.WriteCloser
@@ -50,6 +52,7 @@ type LiveSession struct {
 	CloseReason  string
 	Retention    time.Duration
 	Attached     map[*sessionAttachment]struct{}
+	Controller   *sessionAttachment
 }
 
 type sessionAttachment struct {
@@ -75,6 +78,7 @@ type sessionInfo struct {
 	Attached     bool       `json:"attached"`
 	Attachments  int        `json:"attachments"`
 	Retention    string     `json:"retention"`
+	Order        int        `json:"order"`
 }
 
 func (s *LiveSession) info() sessionInfo {
@@ -106,7 +110,28 @@ func (s *LiveSession) info() sessionInfo {
 		Attached:     len(s.Attached) > 0,
 		Attachments:  len(s.Attached),
 		Retention:    retention,
+		Order:        s.Order,
 	}
+}
+
+func (s *LiveSession) orderValue() int {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	return s.Order
+}
+
+func (s *LiveSession) claimController(att *sessionAttachment) {
+	s.Mu.Lock()
+	if !s.Closed {
+		s.Controller = att
+	}
+	s.Mu.Unlock()
+}
+
+func (s *LiveSession) controllerIs(att *sessionAttachment) bool {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	return !s.Closed && s.Controller == att
 }
 
 func (a *App) reserveLiveSession(userID int64) error {
@@ -180,6 +205,20 @@ func (a *App) activateLiveSession(userID, serverID int64, serverName, host, user
 		return nil, err
 	}
 	now := time.Now()
+	a.mu.Lock()
+	nextOrder := 0
+	for _, live := range a.live {
+		if live.UserID != userID {
+			continue
+		}
+		live.Mu.Lock()
+		order := live.Order
+		live.Mu.Unlock()
+		if order >= nextOrder {
+			nextOrder = order + 1
+		}
+	}
+	a.mu.Unlock()
 	s := &LiveSession{
 		ID:           randID(24),
 		UserID:       userID,
@@ -190,6 +229,7 @@ func (a *App) activateLiveSession(userID, serverID int64, serverName, host, user
 		Port:         port,
 		Transient:    transient,
 		CreatedAt:    now,
+		Order:        nextOrder,
 		SSHSession:   sshSession,
 		In:           in,
 		Out:          out,
@@ -280,6 +320,9 @@ func (a *App) attachSession(s *LiveSession, ws *websocket.Conn) (*sessionAttachm
 		att.send <- append([]byte(nil), s.Buffer...)
 	}
 	s.Attached[att] = struct{}{}
+	if s.Controller == nil {
+		s.Controller = att
+	}
 	s.EverAttached = true
 	s.DetachedAt = time.Time{}
 	s.LastActivity = time.Now()
@@ -292,6 +335,9 @@ func (a *App) detachSession(s *LiveSession, att *sessionAttachment) {
 	now := time.Now()
 	s.Mu.Lock()
 	delete(s.Attached, att)
+	if s.Controller == att {
+		s.Controller = nil
+	}
 	if len(s.Attached) == 0 && !s.Closed {
 		s.DetachedAt = now
 	}
@@ -368,6 +414,7 @@ func (a *App) terminateLiveSession(id, reason string) {
 			attachments = append(attachments, att)
 		}
 		s.Attached = map[*sessionAttachment]struct{}{}
+		s.Controller = nil
 		s.Mu.Unlock()
 		for _, att := range attachments {
 			att.closeWithReason(reason)
@@ -490,6 +537,16 @@ func (a *App) sessions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		a.mu.Unlock()
+		sort.SliceStable(list, func(i, j int) bool {
+			if list[i].UserID != list[j].UserID {
+				return list[i].UserID < list[j].UserID
+			}
+			leftOrder, rightOrder := list[i].orderValue(), list[j].orderValue()
+			if leftOrder != rightOrder {
+				return leftOrder < rightOrder
+			}
+			return list[i].CreatedAt.Before(list[j].CreatedAt)
+		})
 		out := make([]sessionInfo, 0, len(list))
 		for _, s := range list {
 			info := s.info()
@@ -526,6 +583,72 @@ func (a *App) sessions(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (a *App) sessionOrder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var in struct {
+		IDs []string `json:"ids"`
+	}
+	if decode(r, &in) != nil {
+		jsonOut(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+		return
+	}
+	userID := uid(r)
+	seen := make(map[string]struct{}, len(in.IDs))
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ordered := make([]*LiveSession, 0, len(in.IDs))
+	for _, id := range in.IDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		s := a.live[id]
+		if s == nil || s.UserID != userID {
+			jsonOut(w, http.StatusBadRequest, map[string]string{"error": "invalid session order"})
+			return
+		}
+		ordered = append(ordered, s)
+		seen[id] = struct{}{}
+	}
+	order := 0
+	for _, s := range ordered {
+		s.Mu.Lock()
+		s.Order = order
+		s.Mu.Unlock()
+		order++
+	}
+	remaining := make([]*LiveSession, 0)
+	for id, s := range a.live {
+		if s.UserID != userID {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		remaining = append(remaining, s)
+	}
+	sort.SliceStable(remaining, func(i, j int) bool {
+		leftOrder, rightOrder := remaining[i].orderValue(), remaining[j].orderValue()
+		if leftOrder != rightOrder {
+			return leftOrder < rightOrder
+		}
+		return remaining[i].CreatedAt.Before(remaining[j].CreatedAt)
+	})
+	for _, s := range remaining {
+		s.Mu.Lock()
+		s.Order = order
+		s.Mu.Unlock()
+		order++
+	}
+	jsonOut(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (a *App) sessionByID(w http.ResponseWriter, r *http.Request) {
@@ -605,17 +728,32 @@ func (a *App) wsSSH(w http.ResponseWriter, r *http.Request) {
 			if json.Unmarshal(b, &m) != nil {
 				continue
 			}
-			s.ioMu.Lock()
+			validSize := m.Cols >= 20 && m.Cols <= 1000 && m.Rows >= 5 && m.Rows <= 500
 			switch m.Type {
-			case "resize":
-				if m.Cols >= 20 && m.Cols <= 1000 && m.Rows >= 5 && m.Rows <= 500 {
+			case "control":
+				s.claimController(att)
+				if validSize {
+					s.ioMu.Lock()
 					_ = s.SSHSession.WindowChange(m.Rows, m.Cols)
+					s.ioMu.Unlock()
+				}
+			case "resize":
+				if s.controllerIs(att) && validSize {
+					s.ioMu.Lock()
+					_ = s.SSHSession.WindowChange(m.Rows, m.Cols)
+					s.ioMu.Unlock()
 				}
 			case "input":
+				s.claimController(att)
+				s.ioMu.Lock()
+				if validSize {
+					_ = s.SSHSession.WindowChange(m.Rows, m.Cols)
+				}
 				_, _ = s.In.Write([]byte(m.Data))
+				s.ioMu.Unlock()
 			}
-			s.ioMu.Unlock()
 		} else if mt == websocket.BinaryMessage {
+			s.claimController(att)
 			s.ioMu.Lock()
 			_, _ = s.In.Write(b)
 			s.ioMu.Unlock()

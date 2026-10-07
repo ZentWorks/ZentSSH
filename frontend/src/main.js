@@ -41,6 +41,11 @@ const state = {
 const WEB_SESSION_KEEPALIVE_MS = 2 * 60 * 1000;
 let webSessionKeepaliveTimer = null;
 let webSessionKeepaliveInFlight = false;
+const LIVE_SESSION_SYNC_MS = 4000;
+let liveSessionSyncTimer = null;
+let liveSessionSyncInFlight = false;
+let terminalOrderPersistTimer = null;
+const MOBILE_TERMINAL_KEYS_KEY = 'zentssh.mobileTerminalKeys.v1';
 
 function hasOpenTerminalTabs() {
   return state.tabs.some(tab => (tab.type || 'terminal') === 'terminal' && !tab.closing);
@@ -62,6 +67,7 @@ function handleExpiredWebSession() {
   if (!state.me || state.authExpired) return;
   state.authExpired = true;
   suspendTerminalSocketsForAuthExpiry();
+  stopLiveSessionSync();
   if (transferMonitorTimer) { clearTimeout(transferMonitorTimer); transferMonitorTimer = null; }
   state.me = null;
   state.notice = L('Deine Sitzung ist abgelaufen. Bitte erneut anmelden.','Your session has expired. Please sign in again.');
@@ -644,6 +650,7 @@ async function boot() {
   applyDocumentLanguage();
   renderApp();
   startWebSessionKeepalive();
+  startLiveSessionSync();
   bootstrapTransferMonitor();
 }
 
@@ -894,60 +901,142 @@ function queueServerSearch() {
   }, 180);
 }
 
-const LIVE_SESSION_KEY = 'zentssh.openSessions.v1';
-const TAB_ORDER_KEY = 'zentssh.tabOrder.v1';
-function trackedSessionIds() {
-  try { return new Set(JSON.parse(localStorage.getItem(LIVE_SESSION_KEY) || '[]').filter(v => typeof v === 'string')); }
-  catch { return new Set(); }
+const LEGACY_LIVE_SESSION_KEY = 'zentssh.openSessions.v1';
+const LEGACY_TAB_ORDER_KEY = 'zentssh.tabOrder.v1';
+
+function persistTerminalOrderSoon() {
+  clearTimeout(terminalOrderPersistTimer);
+  terminalOrderPersistTimer = setTimeout(async () => {
+    if (!state.me || state.authExpired) return;
+    const ids = state.tabs.filter(tab => (tab.type || 'terminal') === 'terminal' && tab.sessionId && !tab.closing).map(tab => tab.sessionId);
+    try { await api('/sessions/order', { method: 'PATCH', body: JSON.stringify({ ids }) }); }
+    catch (error) { if (!error?.authExpired && error?.status !== 404) console.warn('ZentSSH terminal order sync failed', error); }
+  }, 180);
 }
-function saveTrackedSessionIds(ids) {
-  localStorage.setItem(LIVE_SESSION_KEY, JSON.stringify([...ids]));
+
+function saveTabOrder() { persistTerminalOrderSoon(); }
+
+function terminalTabFromLive(live) {
+  const server = state.servers.find(item => Number(item.id) === Number(live.serverId)) || {
+    id: live.serverId || 0,
+    name: live.serverName || L('SSH-Session','SSH session'),
+    host: live.host || '',
+    username: live.username || '',
+    port: live.port || 22,
+    color: '#35a4ff',
+  };
+  return {
+    id: `t${Date.now()}${Math.random().toString(16).slice(2, 7)}`,
+    type: 'terminal',
+    name: live.serverName || server.name,
+    serverId: live.serverId || 0,
+    sessionId: live.id,
+    reconnectDelay: 750,
+    serverSnapshot: { ...server },
+    remoteOrder: Number(live.order || 0),
+  };
 }
-function trackSession(id) { const ids = trackedSessionIds(); ids.add(id); saveTrackedSessionIds(ids); }
-function untrackSession(id) { const ids = trackedSessionIds(); ids.delete(id); saveTrackedSessionIds(ids); }
-function tabStableKey(tab) {
-  if (!tab) return '';
-  if ((tab.type || 'terminal') === 'terminal' && tab.sessionId) return `terminal:${tab.sessionId}`;
-  if (tab.type === 'files' && tab.serverId) return `files:${tab.serverId}`;
-  return '';
+
+function sortedLiveSessions(list) {
+  return [...(list || [])].sort((a, b) => {
+    const orderDiff = Number(a.order || 0) - Number(b.order || 0);
+    if (orderDiff) return orderDiff;
+    return String(a.createdAt || '').localeCompare(String(b.createdAt || ''));
+  });
 }
-function savedTabOrder() {
-  try { return JSON.parse(localStorage.getItem(TAB_ORDER_KEY) || '[]').filter(v => typeof v === 'string'); }
-  catch { return []; }
-}
-function saveTabOrder() {
-  const keys = state.tabs.map(tabStableKey).filter(Boolean);
-  localStorage.setItem(TAB_ORDER_KEY, JSON.stringify(keys));
-}
-function restoreTrackedSessions() {
-  if (state.tabs.length) return;
-  const wanted = trackedSessionIds();
-  const order = savedTabOrder();
-  const orderIndex = new Map(order.map((key, index) => [key, index]));
-  const restorable = state.liveSessions
-    .filter(s => wanted.has(s.id))
-    .sort((a, b) => {
-      const ai = orderIndex.has(`terminal:${a.id}`) ? orderIndex.get(`terminal:${a.id}`) : Number.MAX_SAFE_INTEGER;
-      const bi = orderIndex.has(`terminal:${b.id}`) ? orderIndex.get(`terminal:${b.id}`) : Number.MAX_SAFE_INTEGER;
-      return ai - bi;
-    });
-  for (const live of restorable) {
-    const server = state.servers.find(s => s.id === live.serverId) || { id: live.serverId || 0, name: live.serverName, host: live.host, username: live.username, port: live.port || 22, color: '#35a4ff' };
-    const tid = `t${Date.now()}${Math.random().toString(16).slice(2, 7)}`;
-    state.tabs.push({ id: tid, type: 'terminal', name: live.serverName || server.name, serverId: live.serverId, sessionId: live.id, reconnectDelay: 750, serverSnapshot: { ...server } });
+
+function reconcileLiveSessions(list, options = {}) {
+  const live = sortedLiveSessions(list);
+  state.liveSessions = live;
+  const liveIds = new Set(live.map(item => item.id));
+  const existingBySession = new Map(state.tabs.filter(tab => (tab.type || 'terminal') === 'terminal' && tab.sessionId).map(tab => [tab.sessionId, tab]));
+  let changed = false;
+  let activatedNewTab = false;
+  const addedTabs = [];
+
+  for (const item of live) {
+    const existing = existingBySession.get(item.id);
+    if (existing) {
+      existing.remoteOrder = Number(item.order || 0);
+      existing.name = item.serverName || existing.name;
+      continue;
+    }
+    const tab = terminalTabFromLive(item);
+    state.tabs.push(tab);
+    existingBySession.set(item.id, tab);
+    addedTabs.push(tab);
+    changed = true;
   }
-  // Remove markers for sessions that no longer exist server-side.
-  const existing = new Set(state.liveSessions.map(s => s.id));
-  for (const id of wanted) if (!existing.has(id)) wanted.delete(id);
-  saveTrackedSessionIds(wanted);
-  if (!state.tabs.length) return;
-  saveTabOrder();
-  state.active = state.tabs[0].id;
-  const tab = state.tabs[0];
-  const server = state.servers.find(s => s.id === tab.serverId) || tab.serverSnapshot;
-  paintTerminal(tab.id, server);
-  renderTabs();
-  setTimeout(() => startTerminal(tab.id, server), 0);
+
+  const vanished = state.tabs.filter(tab => (tab.type || 'terminal') === 'terminal' && tab.sessionId && !liveIds.has(tab.sessionId));
+  for (const tab of vanished) {
+    closeTab(tab.id, false);
+    changed = true;
+  }
+
+  if (!state.draggingTabId) {
+    const terminals = state.tabs.filter(tab => (tab.type || 'terminal') === 'terminal').sort((a, b) => Number(a.remoteOrder || 0) - Number(b.remoteOrder || 0));
+    let terminalIndex = 0;
+    const next = state.tabs.map(tab => (tab.type || 'terminal') === 'terminal' ? terminals[terminalIndex++] : tab);
+    if (next.some((tab, index) => state.tabs[index] !== tab)) {
+      state.tabs = next;
+      changed = true;
+    }
+  }
+
+  if (!state.active && state.tabs.length) {
+    state.active = state.tabs[0].id;
+    activatedNewTab = true;
+    changed = true;
+  }
+  if (changed) {
+    renderTabs();
+    syncServerTerminalHighlights();
+  }
+
+  if ((options.initial || activatedNewTab) && state.active) {
+    const tab = state.tabs.find(item => item.id === state.active);
+    if (tab?.type === 'terminal') {
+      const server = currentServerForTab(tab, tab.serverSnapshot);
+      paintTerminal(tab.id, server);
+      setTimeout(() => startTerminal(tab.id, server), 0);
+    }
+  }
+  for (const tab of addedTabs) {
+    if (tab.id === state.active && (options.initial || activatedNewTab)) continue;
+    const server = currentServerForTab(tab, tab.serverSnapshot);
+    connectTerminal(tab, server);
+  }
+}
+
+function restoreLiveSessions() {
+  // One-time cleanup of the former device-local SSH restoration markers.
+  localStorage.removeItem(LEGACY_LIVE_SESSION_KEY);
+  localStorage.removeItem(LEGACY_TAB_ORDER_KEY);
+  reconcileLiveSessions(state.liveSessions, { initial: true });
+}
+
+async function syncLiveSessions() {
+  if (!state.me || state.authExpired || liveSessionSyncInFlight) return;
+  liveSessionSyncInFlight = true;
+  try {
+    const live = await api('/sessions');
+    reconcileLiveSessions(live);
+  } catch (error) {
+    if (!error?.authExpired && error?.status !== 401) console.warn('ZentSSH live session sync failed', error);
+  } finally {
+    liveSessionSyncInFlight = false;
+  }
+}
+
+function startLiveSessionSync() {
+  stopLiveSessionSync();
+  liveSessionSyncTimer = setInterval(syncLiveSessions, LIVE_SESSION_SYNC_MS);
+}
+
+function stopLiveSessionSync() {
+  if (liveSessionSyncTimer) clearInterval(liveSessionSyncTimer);
+  liveSessionSyncTimer = null;
 }
 
 function renderApp() {
@@ -1007,7 +1096,7 @@ function renderApp() {
   renderTabs();
   syncPWAInstallButton();
   setMobileNav(false);
-  restoreTrackedSessions();
+  restoreLiveSessions();
   if (state.notice) {
     showToast(state.notice);
     state.notice = '';
@@ -1684,7 +1773,6 @@ function quickConnectModal() {
       const tid = `t${Date.now()}${Math.random().toString(16).slice(2, 7)}`;
       state.tabs.push({ id: tid, type: 'terminal', name: pseudo.name, serverId: 0, sessionId: live.id, reconnectDelay: 750, serverSnapshot: pseudo });
       saveTabOrder();
-      trackSession(live.id);
       state.active = tid;
       let saveWarning = '';
       let savedName = '';
@@ -1928,7 +2016,6 @@ async function openTerm(serverId) {
     const tid = `t${Date.now()}${Math.random().toString(16).slice(2, 7)}`;
     state.tabs.push({ id: tid, type: 'terminal', name: server.name, serverId, sessionId: live.id, reconnectDelay: 750 });
     saveTabOrder();
-    trackSession(live.id);
     state.active = tid;
     paintTerminal(tid, server);
     renderTabs();
@@ -1945,10 +2032,11 @@ function paintTerminal(tid, server) {
   if (!tab.panel) {
     const panel = document.createElement('div');
     panel.className = 'termwrap';
-    panel.innerHTML = `<div class="termhead"><div class="termhead-server"><span style="--c:${esc(server.color)}">${esc(server.name)}</span><small>${esc(server.username)}@${esc(server.host)}:${server.port}</small></div><button class="terminal-snippet-button iconbutton has-tooltip" type="button" data-tooltip="${esc(L('Code-Schnipsel · Strg/⌘ + Shift + Leertaste','Code snippets · Ctrl/⌘ + Shift + Space'))}" aria-label="${esc(L('Code-Schnipsel öffnen','Open code snippets'))}">${actionIcon('code')}</button></div><div class="terminal"></div>`;
+    panel.innerHTML = `<div class="termhead"><div class="termhead-server"><span style="--c:${esc(server.color)}">${esc(server.name)}</span><small>${esc(server.username)}@${esc(server.host)}:${server.port}</small></div><button class="terminal-snippet-button iconbutton has-tooltip" type="button" data-tooltip="${esc(L('Code-Schnipsel · Strg/⌘ + Shift + Leertaste','Code snippets · Ctrl/⌘ + Shift + Space'))}" aria-label="${esc(L('Code-Schnipsel öffnen','Open code snippets'))}">${actionIcon('code')}</button></div><div class="terminal"></div>${mobileTerminalToolbarHTML()}`;
     tab.panel = panel;
     tab.termElement = $('.terminal', panel);
     $('.terminal-snippet-button', panel).onclick = () => openSnippetLauncher(tid);
+    bindMobileTerminalToolbar(tab);
   }
   workspace.replaceChildren(tab.panel);
 }
@@ -2229,8 +2317,113 @@ async function movePrivateSnippetToFolder(snippet, folderId) {
   } catch (e) { showToast(e.message, true); }
 }
 
-function sendTerminalInput(tab, data) {
-  if (tab?.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type: 'input', data }));
+function claimTerminalControl(tab) {
+  if (tab?.ws?.readyState !== WebSocket.OPEN || !tab.term) return;
+  tab.ws.send(JSON.stringify({ type: 'control', cols: tab.term.cols, rows: tab.term.rows }));
+}
+
+function applyMobileTerminalModifiers(tab, data) {
+  if (!tab || (!tab.mobileCtrl && !tab.mobileAlt)) return data;
+  let out = String(data ?? '');
+  if (tab.mobileCtrl && out.length === 1) {
+    const code = out.toUpperCase().charCodeAt(0);
+    if (code >= 64 && code <= 95) out = String.fromCharCode(code & 31);
+  }
+  if (tab.mobileAlt && out) out = `\x1b${out}`;
+  tab.mobileCtrl = false;
+  tab.mobileAlt = false;
+  syncMobileTerminalModifierButtons(tab);
+  return out;
+}
+
+function sendTerminalInput(tab, data, options = {}) {
+  if (tab?.ws?.readyState !== WebSocket.OPEN) return;
+  const value = options.skipModifiers ? String(data ?? '') : applyMobileTerminalModifiers(tab, data);
+  tab.ws.send(JSON.stringify({ type: 'input', data: value, cols: tab.term?.cols || 0, rows: tab.term?.rows || 0 }));
+}
+
+function mobileTerminalKeySequence(key) {
+  return ({
+    esc: '\x1b', tab: '\t', up: '\x1b[A', down: '\x1b[B', right: '\x1b[C', left: '\x1b[D',
+    home: '\x1b[H', end: '\x1b[F', pgup: '\x1b[5~', pgdn: '\x1b[6~', ins: '\x1b[2~', del: '\x1b[3~',
+    f1: '\x1bOP', f2: '\x1bOQ', f3: '\x1bOR', f4: '\x1bOS', f5: '\x1b[15~', f6: '\x1b[17~',
+    f7: '\x1b[18~', f8: '\x1b[19~', f9: '\x1b[20~', f10: '\x1b[21~', f11: '\x1b[23~', f12: '\x1b[24~',
+    ctrlc: '\x03', ctrlz: '\x1a', ctrll: '\x0c', ctrla: '\x01', ctrle: '\x05',
+  })[key] || '';
+}
+
+function mobileTerminalSequenceWithModifiers(tab, key) {
+  const base = mobileTerminalKeySequence(key);
+  if (!base || (!tab?.mobileCtrl && !tab?.mobileAlt)) return base;
+  const modifier = tab.mobileCtrl && tab.mobileAlt ? 7 : (tab.mobileCtrl ? 5 : 3);
+  const final = ({
+    up: `\x1b[1;${modifier}A`, down: `\x1b[1;${modifier}B`, right: `\x1b[1;${modifier}C`, left: `\x1b[1;${modifier}D`,
+    home: `\x1b[1;${modifier}H`, end: `\x1b[1;${modifier}F`,
+    pgup: `\x1b[5;${modifier}~`, pgdn: `\x1b[6;${modifier}~`, ins: `\x1b[2;${modifier}~`, del: `\x1b[3;${modifier}~`,
+  })[key] || (tab.mobileAlt ? `\x1b${base}` : base);
+  tab.mobileCtrl = false;
+  tab.mobileAlt = false;
+  syncMobileTerminalModifierButtons(tab);
+  return final;
+}
+
+function mobileTerminalKeysExpanded() { return localStorage.getItem(MOBILE_TERMINAL_KEYS_KEY) === 'expanded'; }
+function setMobileTerminalKeysExpanded(expanded) { localStorage.setItem(MOBILE_TERMINAL_KEYS_KEY, expanded ? 'expanded' : 'compact'); }
+
+function mobileTerminalToolbarHTML() {
+  const expanded = mobileTerminalKeysExpanded();
+  const button = (key, label, extra = '') => `<button type="button" tabindex="-1" class="mobile-terminal-key ${extra}" data-terminal-key="${key}">${label}</button>`;
+  return `<div class="mobile-terminal-keys ${expanded ? 'expanded' : ''}" aria-label="${esc(L('Terminal-Sondertasten','Terminal special keys'))}">
+    <div class="mobile-terminal-keyrow mobile-terminal-keyrow-primary">
+      ${button('esc','ESC')}${button('tab','TAB')}${button('ctrl','CTRL','modifier')}${button('alt','ALT','modifier')}${button('left','←')}${button('up','↑')}${button('down','↓')}${button('right','→')}${button('del','DEL')}${button('expand',expanded ? '−' : '+','expand-key')}
+    </div>
+    <div class="mobile-terminal-keyrow mobile-terminal-keyrow-extra">
+      ${button('home','HOME')}${button('end','END')}${button('pgup','PG↑')}${button('pgdn','PG↓')}${button('ins','INS')}
+      ${button('ctrlc','^C')}${button('ctrlz','^Z')}${button('ctrll','^L')}${button('ctrla','^A')}${button('ctrle','^E')}
+      ${Array.from({ length: 12 }, (_, index) => button(`f${index + 1}`,`F${index + 1}`)).join('')}
+    </div>
+  </div>`;
+}
+
+function syncMobileTerminalModifierButtons(tab) {
+  if (!tab?.panel) return;
+  const ctrl = $('[data-terminal-key="ctrl"]', tab.panel);
+  const alt = $('[data-terminal-key="alt"]', tab.panel);
+  ctrl?.classList.toggle('active', Boolean(tab.mobileCtrl));
+  alt?.classList.toggle('active', Boolean(tab.mobileAlt));
+}
+
+function bindMobileTerminalToolbar(tab) {
+  const toolbar = $('.mobile-terminal-keys', tab?.panel);
+  if (!toolbar) return;
+  $$('button[data-terminal-key]', toolbar).forEach(button => {
+    button.addEventListener('pointerdown', event => event.preventDefault());
+    button.onclick = () => {
+      const key = button.dataset.terminalKey;
+      if (key === 'expand') {
+        const expanded = !toolbar.classList.contains('expanded');
+        toolbar.classList.toggle('expanded', expanded);
+        button.textContent = expanded ? '−' : '+';
+        setMobileTerminalKeysExpanded(expanded);
+        scheduleTerminalGeometrySync(tab, 0, true);
+        tab.term?.focus();
+        return;
+      }
+      if (key === 'ctrl' || key === 'alt') {
+        if (key === 'ctrl') tab.mobileCtrl = !tab.mobileCtrl;
+        else tab.mobileAlt = !tab.mobileAlt;
+        syncMobileTerminalModifierButtons(tab);
+        tab.term?.focus();
+        return;
+      }
+      const sequence = mobileTerminalSequenceWithModifiers(tab, key);
+      if (sequence) {
+        claimTerminalControl(tab);
+        sendTerminalInput(tab, sequence, { skipModifiers: true });
+      }
+      tab.term?.focus();
+    };
+  });
 }
 
 function stripTerminalControl(text) {
@@ -2569,6 +2762,7 @@ async function interceptTerminalCommand(tab, server, command, enterData) {
 
 function handleTerminalData(tab, server, data) {
   if (!tab || tab.interceptPending) return;
+  data = applyMobileTerminalModifiers(tab, data);
   server = currentServerForTab(tab, server);
   if (data === '\r' || data === '\n') {
     const command = terminalCommandForEnter(tab);
@@ -2580,12 +2774,42 @@ function handleTerminalData(tab, server, data) {
       return;
     }
     tab.commandCaptureForced = false;
-    sendTerminalInput(tab, data);
+    sendTerminalInput(tab, data, { skipModifiers: true });
     if (command) trackTerminalCwdAfterCommand(tab, server, command);
     return;
   }
   updateTerminalCommandCapture(tab, data);
-  sendTerminalInput(tab, data);
+  sendTerminalInput(tab, data, { skipModifiers: true });
+}
+
+const MAX_PENDING_TERMINAL_BYTES = 2 * 1024 * 1024;
+function bufferPendingTerminalOutput(tab, payload) {
+  if (!tab) return;
+  const data = typeof payload === 'string' ? payload : new Uint8Array(payload).slice();
+  const size = typeof data === 'string' ? data.length * 2 : data.byteLength;
+  if (!tab.pendingTerminalOutput) tab.pendingTerminalOutput = [];
+  tab.pendingTerminalOutput.push({ data, size });
+  tab.pendingTerminalBytes = Number(tab.pendingTerminalBytes || 0) + size;
+  while (tab.pendingTerminalBytes > MAX_PENDING_TERMINAL_BYTES && tab.pendingTerminalOutput.length > 1) {
+    const removed = tab.pendingTerminalOutput.shift();
+    tab.pendingTerminalBytes -= Number(removed?.size || 0);
+  }
+}
+
+function flushPendingTerminalOutput(tab) {
+  if (!tab?.term || !tab.pendingTerminalOutput?.length) return;
+  const pending = tab.pendingTerminalOutput.splice(0);
+  tab.pendingTerminalBytes = 0;
+  for (const item of pending) {
+    const data = item.data;
+    if (typeof data === 'string') {
+      observeTerminalOutput(tab, data);
+      tab.term.write(data);
+    } else {
+      try { observeTerminalOutput(tab, new TextDecoder().decode(data)); } catch { /* binary terminal output can stay unobserved */ }
+      tab.term.write(data);
+    }
+  }
 }
 
 function startTerminal(tid, server) {
@@ -2602,9 +2826,11 @@ function startTerminal(tid, server) {
     term.onData(data => handleTerminalData(tab, currentServerForTab(tab, server), data));
     term.onBinary(data => {
       if (tab.ws?.readyState !== WebSocket.OPEN) return;
+      claimTerminalControl(tab);
       const bytes = Uint8Array.from(data, character => character.charCodeAt(0) & 0xff);
       tab.ws.send(bytes);
     });
+    element.addEventListener('pointerdown', () => claimTerminalControl(tab), { passive: true });
     term.onResize(size => { if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type: 'resize', cols: size.cols, rows: size.rows })); });
     const resize = () => { if (state.active === tid) scheduleTerminalGeometrySync(tab, 0, true); };
     window.addEventListener('resize', resize, { passive: true });
@@ -2619,6 +2845,7 @@ function startTerminal(tid, server) {
   } else {
     tab.fit?.fit();
   }
+  flushPendingTerminalOutput(tab);
   focusTerminalIfActive(tab);
   if (server?.id && !tab.homePrefetchStarted) {
     tab.homePrefetchStarted = true;
@@ -2637,12 +2864,18 @@ function connectTerminal(tab, server) {
   ws.onopen = () => {
     tab.reconnectDelay = 750;
     tab.reconnectNotice = false;
-    scheduleTerminalGeometrySync(tab, 0, true);
-    ws.send(JSON.stringify({ type: 'resize', cols: tab.term.cols, rows: tab.term.rows }));
+    if (tab.term) {
+      scheduleTerminalGeometrySync(tab, 0, true);
+      ws.send(JSON.stringify({ type: 'resize', cols: tab.term.cols, rows: tab.term.rows }));
+      focusTerminalIfActive(tab);
+    }
     syncServerTerminalHighlights();
-    focusTerminalIfActive(tab);
   };
   ws.onmessage = event => {
+    if (!tab.term) {
+      bufferPendingTerminalOutput(tab, event.data);
+      return;
+    }
     if (typeof event.data === 'string') {
       observeTerminalOutput(tab, event.data);
       tab.term.write(event.data);
@@ -2655,7 +2888,6 @@ function connectTerminal(tab, server) {
   ws.onclose = event => {
     if (tab.closing || state.authExpired || !state.me || !state.tabs.includes(tab)) return;
     if (event.code === 1000 && event.reason) {
-      untrackSession(tab.sessionId);
       const sessionName = tab.name || server?.name || tab.sessionId;
       const message = event.reason === 'remote_closed' ? `SSH-Session „${sessionName}“ beendet.` : `SSH-Session „${sessionName}“ geschlossen.`;
       closeTab(tab.id, false);
@@ -2663,7 +2895,7 @@ function connectTerminal(tab, server) {
       return;
     }
     if (!tab.reconnectNotice) {
-      tab.term.write('\r\n\x1b[33m[Verbindung unterbrochen. Wiederverbinden…]\x1b[0m\r\n');
+      if (tab.term) tab.term.write('\r\n\x1b[33m[Verbindung unterbrochen. Wiederverbinden…]\x1b[0m\r\n');
       tab.reconnectNotice = true;
       syncServerTerminalHighlights();
     }
@@ -2677,7 +2909,6 @@ function connectTerminal(tab, server) {
         connectTerminal(tab, server);
       } catch (e) {
         if (e.status === 404) {
-          untrackSession(tab.sessionId);
           closeTab(tab.id, false);
           showToast(`SSH-Session „${tab.name || server?.name || tab.sessionId}“ beendet.`);
         } else {
@@ -2717,7 +2948,6 @@ function closeTab(id, deleteRemote = true) {
     clearTimeout(tab.reconnectTimer);
     tab.ws?.close();
     if (tab.sessionId) {
-      untrackSession(tab.sessionId);
       if (deleteRemote) api(`/sessions/${encodeURIComponent(tab.sessionId)}`, { method: 'DELETE' }).catch(() => {});
     }
     if (tab.resize) window.removeEventListener('resize', tab.resize);

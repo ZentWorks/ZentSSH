@@ -1,8 +1,12 @@
 package app
 
 import (
+	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -95,5 +99,52 @@ func TestWebSocketHeartbeatWindowAllowsMultiplePings(t *testing.T) {
 	}
 	if websocketWriteTimeout <= 0 || websocketWriteTimeout >= websocketReadTimeout {
 		t.Fatalf("invalid websocket write timeout %s for read timeout %s", websocketWriteTimeout, websocketReadTimeout)
+	}
+}
+
+func TestSessionControllerMovesOnInputOwner(t *testing.T) {
+	first := &sessionAttachment{}
+	second := &sessionAttachment{}
+	s := &LiveSession{Attached: map[*sessionAttachment]struct{}{first: {}, second: {}}}
+	s.claimController(first)
+	if !s.controllerIs(first) || s.controllerIs(second) {
+		t.Fatal("first attachment should control the PTY")
+	}
+	s.claimController(second)
+	if !s.controllerIs(second) || s.controllerIs(first) {
+		t.Fatal("controller should move to the latest active attachment")
+	}
+}
+
+func TestSessionOrderIsPerUserAndRejectsForeignSession(t *testing.T) {
+	a := &App{live: map[string]*LiveSession{
+		"a":       {ID: "a", UserID: 7, Order: 0, CreatedAt: time.Now()},
+		"b":       {ID: "b", UserID: 7, Order: 1, CreatedAt: time.Now().Add(time.Second)},
+		"foreign": {ID: "foreign", UserID: 8, Order: 0, CreatedAt: time.Now()},
+	}}
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/sessions/order", strings.NewReader(`{"ids":["b","a"]}`))
+	req = req.WithContext(context.WithValue(req.Context(), userCtxKey{}, int64(7)))
+	rec := httptest.NewRecorder()
+	a.sessionOrder(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("session order status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := a.live["b"].orderValue(); got != 0 {
+		t.Fatalf("b order = %d, want 0", got)
+	}
+	if got := a.live["a"].orderValue(); got != 1 {
+		t.Fatalf("a order = %d, want 1", got)
+	}
+	if got := a.live["foreign"].orderValue(); got != 0 {
+		t.Fatalf("foreign session order changed to %d", got)
+	}
+
+	req = httptest.NewRequest(http.MethodPatch, "/api/sessions/order", strings.NewReader(`{"ids":["foreign"]}`))
+	req = req.WithContext(context.WithValue(req.Context(), userCtxKey{}, int64(7)))
+	rec = httptest.NewRecorder()
+	a.sessionOrder(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("foreign session order status = %d, want 400", rec.Code)
 	}
 }

@@ -320,6 +320,7 @@ func (a *App) Routes() http.Handler {
 	m.Handle("/api/import/openssh", a.auth(http.HandlerFunc(a.openSSHImportHandler)))
 	m.Handle("/api/files/", a.auth(http.HandlerFunc(a.files)))
 	m.Handle("/api/sessions", a.auth(http.HandlerFunc(a.sessions)))
+	m.Handle("/api/sessions/order", a.auth(http.HandlerFunc(a.sessionOrder)))
 	m.Handle("/api/sessions/quick", a.auth(http.HandlerFunc(a.quickConnect)))
 	m.Handle("/api/sessions/", a.auth(http.HandlerFunc(a.sessionByID)))
 	m.Handle("/api/transfers", a.auth(http.HandlerFunc(a.transfers)))

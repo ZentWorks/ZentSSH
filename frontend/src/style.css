@@ -786,3 +786,17 @@ body{min-height:100vh;min-height:100dvh}
 .local-file-uploading .local-drop-overlay-icon{animation:local-upload-pulse 1.1s ease-in-out infinite}
 @keyframes local-upload-pulse{0%,100%{transform:scale(1);opacity:.86}50%{transform:scale(1.06);opacity:1}}
 @media(max-width:760px){.local-drop-overlay{inset:6px;border-radius:10px}.local-drop-overlay small{font-size:10px}}
+
+/* Mobile terminal helper keyboard. Native text input stays active; this row only adds terminal keys missing on touch keyboards. */
+.mobile-terminal-keys{display:none}
+@media (pointer:coarse) and (max-width:950px){
+  .mobile-terminal-keys{display:flex;flex:0 0 auto;flex-direction:column;gap:4px;padding:5px max(5px,env(safe-area-inset-right,0)) max(5px,env(safe-area-inset-bottom,0)) max(5px,env(safe-area-inset-left,0));border-top:1px solid #182735;background:#0d151e;box-shadow:0 -4px 16px #0004;overflow:hidden;z-index:4}
+  .mobile-terminal-keyrow{display:flex;gap:4px;overflow-x:auto;overflow-y:hidden;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+  .mobile-terminal-keyrow::-webkit-scrollbar{display:none}
+  .mobile-terminal-key{flex:0 0 auto;min-width:42px;height:38px;padding:0 9px;border:1px solid #294052;border-radius:8px;background:#142331;color:#c6d7e5;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;font-weight:650;line-height:1;touch-action:manipulation;user-select:none;-webkit-user-select:none}
+  .mobile-terminal-key:active{background:#20384c;border-color:#3c6887;color:#fff}
+  .mobile-terminal-key.modifier.active{background:#17405a;border-color:#47a3d7;color:#e9f8ff;box-shadow:inset 0 0 0 1px #47a3d744}
+  .mobile-terminal-key.expand-key{min-width:38px;font-size:17px;color:#78bde3}
+  .mobile-terminal-keyrow-extra{display:none}
+  .mobile-terminal-keys.expanded .mobile-terminal-keyrow-extra{display:flex}
+}
