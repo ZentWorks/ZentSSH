@@ -144,11 +144,46 @@ function isMobileLayout() {
   return window.matchMedia?.('(max-width: 760px)').matches === true;
 }
 
-function terminalGeometryPass(tab, refresh = false) {
+function terminalScrollDistanceFromBottom(tab) {
+  const buffer = tab?.term?.buffer?.active;
+  if (!buffer) return 0;
+  return Math.max(0, Number(buffer.baseY || 0) - Number(buffer.viewportY || 0));
+}
+
+function restoreTerminalScrollDistance(tab, distance) {
+  const term = tab?.term;
+  const buffer = term?.buffer?.active;
+  if (!term || !buffer) return;
+  const offset = Math.max(0, Number(distance || 0));
+  if (offset === 0) {
+    term.scrollToBottom();
+    return;
+  }
+  term.scrollToLine(Math.max(0, Number(buffer.baseY || 0) - offset));
+}
+
+function terminalGeometrySignature(tab) {
+  const rect = tab?.termElement?.getBoundingClientRect?.();
+  const dpr = Math.max(0.1, Number(window.devicePixelRatio) || 1);
+  return [
+    Number(tab?.term?.cols || 0), Number(tab?.term?.rows || 0),
+    Math.round(Number(rect?.width || 0) * 10), Math.round(Number(rect?.height || 0) * 10),
+    Math.round(dpr * 1000),
+  ].join(':');
+}
+
+function terminalGeometryPass(tab, refresh = false, forceRefresh = false) {
   if (!tab?.fit || !tab.term || tab.closing || state.active !== tab.id || !tab.termElement?.isConnected) return;
+  const scrollDistance = terminalScrollDistanceFromBottom(tab);
   try {
     tab.fit.fit();
-    if (refresh && tab.term.rows > 0) tab.term.refresh(0, Math.max(0, tab.term.rows - 1));
+    const signature = terminalGeometrySignature(tab);
+    const geometryChanged = signature !== tab.lastTerminalGeometry;
+    tab.lastTerminalGeometry = signature;
+    if (refresh && (geometryChanged || forceRefresh) && tab.term.rows > 0) {
+      tab.term.refresh(0, Math.max(0, tab.term.rows - 1));
+    }
+    restoreTerminalScrollDistance(tab, scrollDistance);
   } catch { /* terminal may be between renders */ }
 }
 
@@ -2783,12 +2818,12 @@ function handleTerminalData(tab, server, data) {
 }
 
 const MAX_PENDING_TERMINAL_BYTES = 2 * 1024 * 1024;
-function bufferPendingTerminalOutput(tab, payload) {
+function bufferPendingTerminalOutput(tab, payload, snapshot = false) {
   if (!tab) return;
   const data = typeof payload === 'string' ? payload : new Uint8Array(payload).slice();
   const size = typeof data === 'string' ? data.length * 2 : data.byteLength;
   if (!tab.pendingTerminalOutput) tab.pendingTerminalOutput = [];
-  tab.pendingTerminalOutput.push({ data, size });
+  tab.pendingTerminalOutput.push({ data, size, snapshot: Boolean(snapshot) });
   tab.pendingTerminalBytes = Number(tab.pendingTerminalBytes || 0) + size;
   while (tab.pendingTerminalBytes > MAX_PENDING_TERMINAL_BYTES && tab.pendingTerminalOutput.length > 1) {
     const removed = tab.pendingTerminalOutput.shift();
@@ -2796,20 +2831,33 @@ function bufferPendingTerminalOutput(tab, payload) {
   }
 }
 
+function writeTerminalPayload(tab, data, snapshot = false) {
+  if (!tab?.term) return;
+  const scrollDistance = terminalScrollDistanceFromBottom(tab);
+  if (snapshot) {
+    // Every WebSocket attachment starts with the server-side terminal ring buffer.
+    // On reconnect, do not append that snapshot to the existing scrollback. Clear
+    // the local buffer while keeping terminal modes (mouse tracking, bracketed
+    // paste, etc.) intact, then replay the authoritative server snapshot.
+    if (tab.terminalSnapshotApplied) tab.term.clear();
+    tab.terminalSnapshotApplied = true;
+    tab.lastTerminalGeometry = null;
+  }
+  if (typeof data === 'string') {
+    observeTerminalOutput(tab, data);
+  } else {
+    try { observeTerminalOutput(tab, new TextDecoder().decode(data)); } catch { /* binary terminal output can stay unobserved */ }
+  }
+  tab.term.write(data, () => {
+    if (snapshot || scrollDistance === 0) restoreTerminalScrollDistance(tab, scrollDistance);
+  });
+}
+
 function flushPendingTerminalOutput(tab) {
   if (!tab?.term || !tab.pendingTerminalOutput?.length) return;
   const pending = tab.pendingTerminalOutput.splice(0);
   tab.pendingTerminalBytes = 0;
-  for (const item of pending) {
-    const data = item.data;
-    if (typeof data === 'string') {
-      observeTerminalOutput(tab, data);
-      tab.term.write(data);
-    } else {
-      try { observeTerminalOutput(tab, new TextDecoder().decode(data)); } catch { /* binary terminal output can stay unobserved */ }
-      tab.term.write(data);
-    }
-  }
+  for (const item of pending) writeTerminalPayload(tab, item.data, item.snapshot);
 }
 
 function startTerminal(tid, server) {
@@ -2817,7 +2865,7 @@ function startTerminal(tid, server) {
   const element = tab?.termElement;
   if (!tab || !element || !tab.sessionId) return;
   if (!tab.term) {
-    const term = new Terminal({ cursorBlink: true, fontFamily: 'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace', fontSize: 14, theme: { background: '#0b1017', foreground: '#d8e2ef' } });
+    const term = new Terminal({ cursorBlink: true, scrollOnUserInput: true, fontFamily: 'ui-monospace,SFMono-Regular,Menlo,Consolas,monospace', fontSize: 14, theme: { background: '#0b1017', foreground: '#d8e2ef' } });
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(element);
@@ -2830,7 +2878,13 @@ function startTerminal(tid, server) {
       const bytes = Uint8Array.from(data, character => character.charCodeAt(0) & 0xff);
       tab.ws.send(bytes);
     });
-    element.addEventListener('pointerdown', () => claimTerminalControl(tab), { passive: true });
+    element.addEventListener('pointerdown', () => {
+      if (state.active !== tid) return;
+      // Run before xterm handles the pointer. On HiDPI/4K displays this makes
+      // xterm's mouse cell calculation and the remote PTY use the same geometry.
+      terminalGeometryPass(tab, true, true);
+      claimTerminalControl(tab);
+    }, { capture: true, passive: true });
     term.onResize(size => { if (tab.ws?.readyState === WebSocket.OPEN) tab.ws.send(JSON.stringify({ type: 'resize', cols: size.cols, rows: size.rows })); });
     const resize = () => { if (state.active === tid) scheduleTerminalGeometrySync(tab, 0, true); };
     window.addEventListener('resize', resize, { passive: true });
@@ -2861,6 +2915,9 @@ function connectTerminal(tab, server) {
   const ws = new WebSocket(`${proto}://${location.host}/ws/ssh/${encodeURIComponent(tab.sessionId)}`);
   ws.binaryType = 'arraybuffer';
   tab.ws = ws;
+  // The backend always sends the current terminal ring buffer first for a new
+  // attachment. Mark that first payload so reconnects rebuild instead of append.
+  tab.expectTerminalSnapshot = true;
   ws.onopen = () => {
     tab.reconnectDelay = 750;
     tab.reconnectNotice = false;
@@ -2872,18 +2929,14 @@ function connectTerminal(tab, server) {
     syncServerTerminalHighlights();
   };
   ws.onmessage = event => {
+    const snapshot = Boolean(tab.expectTerminalSnapshot);
+    tab.expectTerminalSnapshot = false;
+    const payload = typeof event.data === 'string' ? event.data : new Uint8Array(event.data);
     if (!tab.term) {
-      bufferPendingTerminalOutput(tab, event.data);
+      bufferPendingTerminalOutput(tab, payload, snapshot);
       return;
     }
-    if (typeof event.data === 'string') {
-      observeTerminalOutput(tab, event.data);
-      tab.term.write(event.data);
-    } else {
-      const bytes = new Uint8Array(event.data);
-      try { observeTerminalOutput(tab, new TextDecoder().decode(bytes)); } catch { /* binary terminal output can stay unobserved */ }
-      tab.term.write(bytes);
-    }
+    writeTerminalPayload(tab, payload, snapshot);
   };
   ws.onclose = event => {
     if (tab.closing || state.authExpired || !state.me || !state.tabs.includes(tab)) return;
