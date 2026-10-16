@@ -972,6 +972,50 @@ function terminalTabFromLive(live) {
   };
 }
 
+function terminalTabsForSession(sessionId) {
+  if (!sessionId) return [];
+  return state.tabs.filter(tab => (tab.type || 'terminal') === 'terminal' && tab.sessionId === sessionId && !tab.closing);
+}
+
+function discardDuplicateTerminalTab(tab) {
+  if (!tab) return false;
+  const index = state.tabs.indexOf(tab);
+  if (index < 0) return false;
+  tab.closing = true;
+  disposeTerminalTabRuntime(tab, false);
+  state.tabs.splice(index, 1);
+  return true;
+}
+
+function ensureTerminalTabForLiveSession(live, options = {}) {
+  if (!live?.id) return { tab: null, created: false, deduped: false };
+  const matches = terminalTabsForSession(live.id);
+  let tab = matches.find(item => item.id === state.active) || matches[0] || null;
+  let deduped = false;
+
+  for (const duplicate of matches) {
+    if (duplicate === tab) continue;
+    deduped = discardDuplicateTerminalTab(duplicate) || deduped;
+  }
+
+  let created = false;
+  if (!tab) {
+    tab = terminalTabFromLive(live);
+    state.tabs.push(tab);
+    created = true;
+  }
+
+  const snapshot = options.serverSnapshot || state.servers.find(item => Number(item.id) === Number(live.serverId || tab.serverId));
+  if (snapshot) tab.serverSnapshot = { ...snapshot };
+  if (live.serverId != null) tab.serverId = Number(live.serverId || 0);
+  if (live.serverName || options.name) tab.name = live.serverName || options.name;
+  if (live.order != null) tab.remoteOrder = Number(live.order || 0);
+  tab.reconnectDelay ||= 750;
+
+  if (options.activate) state.active = tab.id;
+  return { tab, created, deduped };
+}
+
 function sortedLiveSessions(list) {
   return [...(list || [])].sort((a, b) => {
     const orderDiff = Number(a.order || 0) - Number(b.order || 0);
@@ -984,23 +1028,16 @@ function reconcileLiveSessions(list, options = {}) {
   const live = sortedLiveSessions(list);
   state.liveSessions = live;
   const liveIds = new Set(live.map(item => item.id));
-  const existingBySession = new Map(state.tabs.filter(tab => (tab.type || 'terminal') === 'terminal' && tab.sessionId).map(tab => [tab.sessionId, tab]));
   let changed = false;
   let activatedNewTab = false;
   const addedTabs = [];
 
   for (const item of live) {
-    const existing = existingBySession.get(item.id);
-    if (existing) {
-      existing.remoteOrder = Number(item.order || 0);
-      existing.name = item.serverName || existing.name;
-      continue;
-    }
-    const tab = terminalTabFromLive(item);
-    state.tabs.push(tab);
-    existingBySession.set(item.id, tab);
-    addedTabs.push(tab);
-    changed = true;
+    const ensured = ensureTerminalTabForLiveSession(item);
+    const tab = ensured.tab;
+    if (!tab) continue;
+    if (ensured.created) addedTabs.push(tab);
+    if (ensured.created || ensured.deduped) changed = true;
   }
 
   const vanished = state.tabs.filter(tab => (tab.type || 'terminal') === 'terminal' && tab.sessionId && !liveIds.has(tab.sessionId));
@@ -1805,10 +1842,11 @@ function quickConnectModal() {
       if (!result?.session?.id) throw new Error('Quick Connect konnte nicht gestartet werden.');
       const live = result.session;
       const pseudo = { id: 0, name: live.serverName, host: live.host || result.target?.host, username: live.username || result.username, port: live.port || result.target?.port || 22, color: '#35a4ff' };
-      const tid = `t${Date.now()}${Math.random().toString(16).slice(2, 7)}`;
-      state.tabs.push({ id: tid, type: 'terminal', name: pseudo.name, serverId: 0, sessionId: live.id, reconnectDelay: 750, serverSnapshot: pseudo });
+      const ensuredTab = ensureTerminalTabForLiveSession(live, { serverSnapshot: pseudo, name: pseudo.name });
+      const terminalTab = ensuredTab.tab;
+      if (!terminalTab) throw new Error('Quick Connect konnte nicht als Terminal geöffnet werden.');
       saveTabOrder();
-      state.active = tid;
+      state.active = terminalTab.id;
       let saveWarning = '';
       let savedName = '';
       if (saveRequested) {
@@ -1849,9 +1887,7 @@ function quickConnectModal() {
         }
       }
       modal.innerHTML = '';
-      paintTerminal(tid, pseudo);
-      renderTabs();
-      setTimeout(() => startTerminal(tid, pseudo), 0);
+      activate(terminalTab.id);
       if (saveWarning) showToast(saveWarning, true);
       else if (savedName) showToast(`Verbunden und als „${savedName}“ gespeichert.`);
       else showToast('Quick Connect verbunden.');
@@ -2048,13 +2084,10 @@ async function openTerm(serverId) {
   try {
     await ensureServerReady(serverId);
     const live = await api('/sessions', { method: 'POST', body: JSON.stringify({ serverId, cols: 120, rows: 36 }) });
-    const tid = `t${Date.now()}${Math.random().toString(16).slice(2, 7)}`;
-    state.tabs.push({ id: tid, type: 'terminal', name: server.name, serverId, sessionId: live.id, reconnectDelay: 750 });
+    const ensured = ensureTerminalTabForLiveSession(live, { serverSnapshot: server, name: server.name, activate: true });
+    if (!ensured.tab) throw new Error(L('SSH-Session konnte nicht geöffnet werden.','SSH session could not be opened.'));
     saveTabOrder();
-    state.active = tid;
-    paintTerminal(tid, server);
-    renderTabs();
-    setTimeout(() => startTerminal(tid, server), 0);
+    activate(ensured.tab.id);
   } catch (e) {
     if (e.message !== 'cancelled') showToast(e.message, true);
   }
@@ -2991,24 +3024,25 @@ function activate(id) {
   } else startTerminal(id, server);
 }
 
+function disposeTerminalTabRuntime(tab, deleteRemote = true) {
+  if (!tab || (tab.type || 'terminal') !== 'terminal') return;
+  clearTimeout(tab.reconnectTimer);
+  tab.ws?.close();
+  if (deleteRemote && tab.sessionId) api(`/sessions/${encodeURIComponent(tab.sessionId)}`, { method: 'DELETE' }).catch(() => {});
+  if (tab.resize) window.removeEventListener('resize', tab.resize);
+  tab.resizeObserver?.disconnect();
+  removeTerminalDPRWatcher(tab);
+  clearTimeout(tab.geometryTimer);
+  tab.term?.dispose();
+}
+
 function closeTab(id, deleteRemote = true) {
   const index = state.tabs.findIndex(t => t.id === id);
   if (index < 0) return;
   const tab = state.tabs[index];
   const wasActive = state.active === id;
   tab.closing = true;
-  if ((tab.type || 'terminal') === 'terminal') {
-    clearTimeout(tab.reconnectTimer);
-    tab.ws?.close();
-    if (tab.sessionId) {
-      if (deleteRemote) api(`/sessions/${encodeURIComponent(tab.sessionId)}`, { method: 'DELETE' }).catch(() => {});
-    }
-    if (tab.resize) window.removeEventListener('resize', tab.resize);
-    tab.resizeObserver?.disconnect();
-    removeTerminalDPRWatcher(tab);
-    clearTimeout(tab.geometryTimer);
-    tab.term?.dispose();
-  }
+  disposeTerminalTabRuntime(tab, deleteRemote);
   state.tabs.splice(index, 1);
   saveTabOrder();
   if (wasActive) {
